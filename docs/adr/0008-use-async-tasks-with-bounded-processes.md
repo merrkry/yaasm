@@ -1,0 +1,3 @@
+# Use async tasks with bounded processes
+
+YAASM uses Tokio tasks freely for independent work but bounds concurrent Git and GitHub CLI child processes to four by default with a semaphore, configurable through `--jobs`, because scheduling futures does not limit external processes. A source snapshot directory is materialized as one task and one directory-level operation; cleanup, the single sorted lock write, and directory scans remain behind their dependency barriers. Child commands run in Unix process groups or Windows Job Objects so Ctrl-C can cancel and reap their complete process trees without committing unfinished work.

@@ -1,0 +1,3 @@
+# Isolate failures by dependency branch
+
+YAASM processes sibling sources, skills, and placements independently instead of treating the complete configuration as one transaction. Predictable structural conflicts are rejected during preflight, after which sibling work has no semantic ordering and may run concurrently. Updating one source is atomic: YAASM prepares it in staging and validates that its revision is deployable before committing its lock entry and snapshot; a source failure preserves its previous state and prevents only its downstream work. Stale-link cleanup has a separate target-level safety barrier and runs only after every configured skill succeeds for that target. Unrelated branches continue and the command reports every failure.
