@@ -39,9 +39,12 @@ struct SourceOutcome {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let paths = AppPaths::resolve(cli.config_dir, cli.data_dir)?;
+    let mut paths = AppPaths::resolve(cli.config_dir, cli.data_dir)?;
     tokio::fs::create_dir_all(&paths.config_dir).await?;
     tokio::fs::create_dir_all(&paths.data_dir).await?;
+    paths.config_dir = tokio::fs::canonicalize(&paths.config_dir).await?;
+    paths.data_dir = tokio::fs::canonicalize(&paths.data_dir).await?;
+    reject_overlap(&paths.config_dir, &paths.data_dir)?;
     let _locks = ProcessLocks::acquire(&paths.config_dir, &paths.data_dir)?;
     initialize_data_dir(&paths.data_dir).await?;
     clean_staging(&paths.data_dir).await?;
@@ -102,6 +105,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         let requested_revision = (!must_update)
             .then(|| old.map(|entry| entry.revision.clone()))
             .flatten();
+        let rebuild_repository =
+            must_update && old.is_none_or(|entry| entry.fingerprint != source_fingerprint);
         tasks.spawn(async move {
             let materialized = worker
                 .resolve(
@@ -110,6 +115,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     &source_fingerprint,
                     requested_revision.as_deref(),
                     &selected,
+                    rebuild_repository,
                 )
                 .await;
             SourceOutcome {

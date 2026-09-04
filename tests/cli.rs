@@ -98,6 +98,103 @@ fn refuses_target_collision() {
 
 #[cfg(unix)]
 #[test]
+fn one_broken_skill_does_not_block_siblings_or_clean_target() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    let target = temp.path().join("target");
+    let stale = temp.path().join("stale");
+    let working = temp.path().join("working");
+    let missing = temp.path().join("missing");
+    fs::create_dir_all(&stale).unwrap();
+    fs::create_dir_all(&working).unwrap();
+    fs::write(stale.join("SKILL.md"), "stale").unwrap();
+    fs::write(working.join("SKILL.md"), "working").unwrap();
+    write_config(
+        &config,
+        &format!(
+            "version = 1\ntargets = [{}]\n[skills.stale]\nsource = \"local\"\npath = {}\n",
+            toml::Value::String(target.to_string_lossy().into_owned()),
+            toml::Value::String(stale.to_string_lossy().into_owned())
+        ),
+    );
+    assert_success(yaasm(&config, &data, "deploy"));
+
+    write_config(
+        &config,
+        &format!(
+            "version = 1\ntargets = [{}]\n[skills.working]\nsource = \"local\"\npath = {}\n[skills.broken]\nsource = \"local\"\npath = {}\n",
+            toml::Value::String(target.to_string_lossy().into_owned()),
+            toml::Value::String(working.to_string_lossy().into_owned()),
+            toml::Value::String(missing.to_string_lossy().into_owned())
+        ),
+    );
+    let output = yaasm(&config, &data, "deploy");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(target.join("working/SKILL.md")).unwrap(),
+        "working"
+    );
+    assert!(fs::symlink_metadata(target.join("broken")).is_err());
+    assert!(fs::symlink_metadata(target.join("stale")).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_source_fails_only_its_skill() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    let target = temp.path().join("target");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("SKILL.md"), "working").unwrap();
+    write_config(
+        &config,
+        &format!(
+            "version = 1\ntargets = [{}]\n[skills.working]\nsource = \"local\"\npath = {}\n[skills.broken]\nsource = \"unknown\"\npath = \"skills/broken\"\n",
+            toml::Value::String(target.to_string_lossy().into_owned()),
+            toml::Value::String(local.to_string_lossy().into_owned())
+        ),
+    );
+    let output = yaasm(&config, &data, "deploy");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(target.join("working/SKILL.md")).unwrap(),
+        "working"
+    );
+    assert!(fs::symlink_metadata(target.join("broken")).is_err());
+}
+
+#[test]
+fn locked_deploy_requires_complete_matching_lock() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    write_config(
+        &config,
+        "version = 1\n[sources.origin]\ngit = \"https://example.invalid/repo.git\"\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
+        .arg("--config-dir")
+        .arg(&config)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["deploy", "--locked"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lockfile has no entry"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!config.join("lock.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn deploys_and_updates_git_skill() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repository");
@@ -163,6 +260,40 @@ fn deploys_and_updates_git_skill() {
     assert_ne!(
         first_lock,
         fs::read_to_string(config.join("lock.toml")).unwrap()
+    );
+
+    let replacement = temp.path().join("replacement");
+    fs::create_dir_all(replacement.join("skills/demo")).unwrap();
+    git(
+        temp.path(),
+        ["init", "-b", "main", replacement.to_str().unwrap()],
+    );
+    fs::write(replacement.join("skills/demo/SKILL.md"), "replacement").unwrap();
+    git(&replacement, ["add", "."]);
+    git(
+        &replacement,
+        [
+            "-c",
+            "user.name=YAASM Test",
+            "-c",
+            "user.email=yaasm@example.invalid",
+            "commit",
+            "-m",
+            "replacement",
+        ],
+    );
+    write_config(
+        &config,
+        &format!(
+            "version = 1\ntargets = [{}]\n[sources.origin]\ngit = {}\nref = \"main\"\n[skills.demo]\nsource = \"origin\"\npath = \"skills/demo\"\n",
+            toml::Value::String(target.to_string_lossy().into_owned()),
+            toml::Value::String(replacement.to_string_lossy().into_owned())
+        ),
+    );
+    assert_success(yaasm(&config, &data, "deploy"));
+    assert_eq!(
+        fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
+        "replacement"
     );
 }
 

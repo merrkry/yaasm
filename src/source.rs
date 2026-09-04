@@ -40,8 +40,11 @@ impl SourceMaterializer {
         fingerprint: &str,
         requested_revision: Option<&str>,
         paths: &[String],
+        rebuild_repository: bool,
     ) -> Result<MaterializedSource> {
-        let repository = self.ensure_repository(name, source).await?;
+        let repository = self
+            .ensure_repository(name, source, rebuild_repository)
+            .await?;
         let revision = match requested_revision {
             Some(revision) => {
                 self.fetch(&repository, source, Some(revision)).await?;
@@ -97,9 +100,14 @@ impl SourceMaterializer {
         })
     }
 
-    async fn ensure_repository(&self, name: &str, source: &SourceConfig) -> Result<PathBuf> {
+    async fn ensure_repository(
+        &self,
+        name: &str,
+        source: &SourceConfig,
+        rebuild: bool,
+    ) -> Result<PathBuf> {
         let repository = self.data_dir.join("repos").join(name);
-        if tokio::fs::try_exists(repository.join(".git")).await? {
+        if !rebuild && tokio::fs::try_exists(repository.join(".git")).await? {
             return Ok(repository);
         }
         if tokio::fs::try_exists(&repository).await? {
