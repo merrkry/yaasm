@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
@@ -189,6 +190,10 @@ impl SourceMaterializer {
         tokio::fs::create_dir_all(&staging).await?;
         self.validate_git_tree(repository, revision, selected_paths, required_paths)
             .await?;
+        // A path-limited checkout from a blobless partial clone fetches missing blobs
+        // one at a time. Fetch them together first to avoid one connection per file.
+        self.prefetch_missing_objects(repository, revision, selected_paths)
+            .await?;
 
         let mut command = self.git(repository);
         command
@@ -240,6 +245,38 @@ impl SourceMaterializer {
         Ok(())
     }
 
+    async fn prefetch_missing_objects(
+        &self,
+        repository: &Path,
+        revision: &str,
+        selected_paths: &[String],
+    ) -> Result<()> {
+        let mut arguments = vec!["rev-list", "--objects", "--missing=print", revision, "--"];
+        arguments.extend(selected_paths.iter().map(String::as_str));
+        let objects = self.git_output(repository, arguments).await?;
+        let missing = missing_object_ids(&objects);
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let mut input = missing.join("\n");
+        input.push('\n');
+        let mut command = self.git(repository);
+        command
+            .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin"])
+            .args([
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+                "--filter=blob:none",
+                "--stdin",
+            ]);
+        self.output_with_input(command, "git fetch", Some(input.as_bytes()))
+            .await
+            .map(|_| ())
+            .context("failed to prefetch selected files")
+    }
+
     async fn validate_snapshot(&self, root: &Path, paths: &[String]) -> Result<()> {
         for path in paths {
             let metadata = tokio::fs::symlink_metadata(root.join(path).join("SKILL.md"))
@@ -279,7 +316,16 @@ impl SourceMaterializer {
         self.output(command, label).await.map(|_| ())
     }
 
-    async fn output(&self, mut command: Command, label: &str) -> Result<String> {
+    async fn output(&self, command: Command, label: &str) -> Result<String> {
+        self.output_with_input(command, label, None).await
+    }
+
+    async fn output_with_input(
+        &self,
+        mut command: Command,
+        label: &str,
+        input: Option<&[u8]>,
+    ) -> Result<String> {
         let _permit = self
             .process_limit
             .acquire()
@@ -288,14 +334,30 @@ impl SourceMaterializer {
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GH_PROMPT_DISABLED", "1")
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = command
-            .output()
-            .await
+        let mut child = command
+            .spawn()
             .with_context(|| format!("failed to start {label}"))?;
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .context("failed to open child stdin")?
+                .write_all(input)
+                .await
+                .with_context(|| format!("failed to write to {label}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .with_context(|| format!("failed to wait for {label}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("{label} failed: {}", stderr.trim());
@@ -310,6 +372,13 @@ impl SourceMaterializer {
             .join(".staging")
             .join(format!("{prefix}-{}-{id}", std::process::id()))
     }
+}
+
+fn missing_object_ids(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix('?'))
+        .collect()
 }
 
 pub fn selected_paths(paths: &[String]) -> Vec<String> {
@@ -363,5 +432,11 @@ mod tests {
             snapshot_hash("f", "r", &["a".into()]),
             snapshot_hash("f", "r", &["b".into()])
         );
+    }
+
+    #[test]
+    fn extracts_only_missing_object_ids() {
+        let output = "012345 path/to/file\n?abcdef\n?789012\n";
+        assert_eq!(missing_object_ids(output), ["abcdef", "789012"]);
     }
 }

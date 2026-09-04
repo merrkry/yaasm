@@ -14,7 +14,7 @@ hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 shellexpand = "3.1.2"
-tokio = { version = "1.53.1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync"] }
 toml = "1.1.5"
 
 [dev-dependencies]
@@ -22,4 +22,3 @@ tempfile = "3.27.0"
 
 [target."cfg(windows)".dependencies]
 junction = "2.0.0"
-
