@@ -7,7 +7,7 @@ use serde::Deserialize;
 pub const CONFIG_VERSION: u32 = 1;
 pub const LOCAL_SOURCE: &str = "local";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
@@ -75,7 +75,11 @@ impl Config {
         validate_named_collection("source", self.sources.keys())?;
         validate_named_collection("skill", self.skills.keys())?;
 
-        if self.sources.contains_key(LOCAL_SOURCE) {
+        if self
+            .sources
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(LOCAL_SOURCE))
+        {
             bail!("`local` is reserved and cannot be declared as a source");
         }
 
@@ -99,12 +103,6 @@ impl Config {
         }
 
         for (name, skill) in &self.skills {
-            if skill.source != LOCAL_SOURCE && !self.sources.contains_key(&skill.source) {
-                bail!(
-                    "skill `{name}` references unknown source `{}`",
-                    skill.source
-                );
-            }
             validate_skill_path(name, skill)?;
         }
 
