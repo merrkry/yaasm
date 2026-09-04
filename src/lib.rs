@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod links;
 pub mod lockfile;
+mod output;
 pub mod paths;
 pub mod process_lock;
 pub mod source;

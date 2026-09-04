@@ -10,8 +10,9 @@ use tokio::task::JoinSet;
 
 use crate::cli::{Cli, Command};
 use crate::config::{Config, LOCAL_SOURCE};
-use crate::links::{clean_target, establish_owned_link, establish_placement};
+use crate::links::{clean_target, establish_owned_link, establish_placement, link_destination};
 use crate::lockfile::{LockedSource, Lockfile, fingerprint};
+use crate::output::{Output, SkillChange};
 use crate::paths::{AppPaths, absolute_without_parent, home_dir, reject_overlap};
 use crate::process_lock::ProcessLocks;
 use crate::source::{MaterializedSource, SourceMaterializer};
@@ -39,6 +40,16 @@ struct SourceOutcome {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    let output = Output::new();
+    let result = run_inner(cli, &output).await;
+    if result.is_err() {
+        output.finish();
+    }
+    result
+}
+
+async fn run_inner(cli: Cli, output: &Output) -> Result<()> {
+    output.phase("Preparing workspace");
     let mut paths = AppPaths::resolve(cli.config_dir, cli.data_dir)?;
     tokio::fs::create_dir_all(&paths.config_dir).await?;
     tokio::fs::create_dir_all(&paths.data_dir).await?;
@@ -49,6 +60,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     initialize_data_dir(&paths.data_dir).await?;
     clean_staging(&paths.data_dir).await?;
 
+    output.phase("Reading configuration");
     let config = Config::load(&paths.config_dir.join("config.toml")).await?;
     let runtime = resolve_runtime_paths(&config, &paths).await?;
     let mut lock = Lockfile::load_if_exists(&paths.config_dir.join("lock.toml")).await?;
@@ -61,6 +73,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         validate_locked(&config, &lock)?;
     }
 
+    output.phase("Resolving sources");
     let mut ready = BTreeMap::new();
     let mut tasks = JoinSet::new();
     for (name, source) in &config.sources {
@@ -100,6 +113,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         let worker = materializer.clone();
+        let progress = output.source(name);
         let name = name.clone();
         let source = source.clone();
         let requested_revision = (!must_update)
@@ -118,6 +132,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     rebuild_repository,
                 )
                 .await;
+            progress.finish_and_clear();
             SourceOutcome {
                 name,
                 fingerprint: source_fingerprint,
@@ -174,6 +189,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         write_lock(&paths.config_dir.join("lock.toml"), lock.to_toml()?).await?;
     }
 
+    output.phase(format!("Deploying {} skills", config.skills.len()));
     let skill_results = establish_skill_entries(&config, &runtime, &paths, &ready).await;
     for (name, result) in &skill_results {
         if let Err(error) = result {
@@ -183,11 +199,27 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let targets_clean =
         deploy_targets(&config, &runtime, &paths, &skill_results, &mut errors).await;
+    let mut removed = BTreeSet::new();
     if targets_clean && errors.is_empty() {
-        clean_data(&config, &paths, &ready).await?;
+        output.phase("Cleaning up");
+        removed = clean_data(&config, &paths, &ready).await?;
     }
 
     if errors.is_empty() {
+        let mut added = BTreeSet::new();
+        let mut updated = BTreeSet::new();
+        for (name, result) in skill_results {
+            match result? {
+                SkillChange::Added => {
+                    added.insert(name);
+                }
+                SkillChange::Updated => {
+                    updated.insert(name);
+                }
+                SkillChange::Unchanged => {}
+            }
+        }
+        output.summary(&added, &updated, &removed);
         Ok(())
     } else {
         errors.sort();
@@ -358,7 +390,7 @@ async fn establish_skill_entries(
     runtime: &RuntimePaths,
     paths: &AppPaths,
     ready: &BTreeMap<String, MaterializedSource>,
-) -> BTreeMap<String, Result<()>> {
+) -> BTreeMap<String, Result<SkillChange>> {
     let mut tasks = JoinSet::new();
     for (name, skill) in &config.skills {
         let name = name.clone();
@@ -374,10 +406,7 @@ async fn establish_skill_entries(
         };
         tasks.spawn(async move {
             let result = match destination {
-                Some(destination) => match validate_local_skill(&destination).await {
-                    Ok(()) => establish_owned_link(&link, &destination).await,
-                    Err(error) => Err(error),
-                },
+                Some(destination) => establish_skill_entry(&link, &destination).await,
                 None => Err(anyhow::anyhow!(
                     "source `{}` is not deployable",
                     skill.source
@@ -400,6 +429,17 @@ async fn establish_skill_entries(
     results
 }
 
+async fn establish_skill_entry(link: &Path, destination: &Path) -> Result<SkillChange> {
+    validate_local_skill(destination).await?;
+    let previous = link_destination(link).await?;
+    establish_owned_link(link, destination).await?;
+    Ok(match previous {
+        None => SkillChange::Added,
+        Some(previous) if previous == destination => SkillChange::Unchanged,
+        Some(_) => SkillChange::Updated,
+    })
+}
+
 async fn validate_local_skill(path: &Path) -> Result<()> {
     let metadata = tokio::fs::symlink_metadata(path.join("SKILL.md"))
         .await
@@ -414,7 +454,7 @@ async fn deploy_targets(
     config: &Config,
     runtime: &RuntimePaths,
     paths: &AppPaths,
-    skill_results: &BTreeMap<String, Result<()>>,
+    skill_results: &BTreeMap<String, Result<SkillChange>>,
     errors: &mut Vec<String>,
 ) -> bool {
     let desired: BTreeSet<_> = config.skills.keys().cloned().collect();
@@ -459,8 +499,8 @@ async fn clean_data(
     config: &Config,
     paths: &AppPaths,
     ready: &BTreeMap<String, MaterializedSource>,
-) -> Result<()> {
-    clean_named_children(
+) -> Result<BTreeSet<String>> {
+    let removed = clean_named_children(
         &paths.data_dir.join("skills"),
         &config.skills.keys().cloned().collect(),
     )
@@ -481,10 +521,15 @@ async fn clean_data(
                 .map(str::to_owned)
         })
         .collect();
-    clean_named_children(&paths.data_dir.join("snapshots"), &snapshots).await
+    clean_named_children(&paths.data_dir.join("snapshots"), &snapshots).await?;
+    Ok(removed)
 }
 
-async fn clean_named_children(directory: &Path, keep: &BTreeSet<String>) -> Result<()> {
+async fn clean_named_children(
+    directory: &Path,
+    keep: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut removed = BTreeSet::new();
     let mut entries = tokio::fs::read_dir(directory).await?;
     while let Some(entry) = entries.next_entry().await? {
         if keep.contains(entry.file_name().to_string_lossy().as_ref()) {
@@ -496,8 +541,9 @@ async fn clean_named_children(directory: &Path, keep: &BTreeSet<String>) -> Resu
         } else {
             tokio::fs::remove_file(entry.path()).await?;
         }
+        removed.insert(entry.file_name().to_string_lossy().into_owned());
     }
-    Ok(())
+    Ok(removed)
 }
 
 async fn write_lock(path: &Path, contents: String) -> Result<()> {

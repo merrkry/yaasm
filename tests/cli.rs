@@ -50,11 +50,24 @@ path = "${YAASM_CONFIG_DIR}/local-skill"
 "#,
     );
 
-    assert_success(yaasm(&config, &data, "deploy"));
+    let output = yaasm(&config, &data, "deploy");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Added: demo"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_success(output);
     assert_eq!(
         fs::read_to_string(config.join("target/demo/SKILL.md")).unwrap(),
         "local"
     );
+
+    let output = yaasm(&config, &data, "deploy");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Already up to date"
+    );
+    assert_success(output);
 }
 
 #[cfg(unix)]
@@ -94,7 +107,13 @@ fn deploys_local_skill_and_cleans_stale_link() {
             toml::Value::String(target.to_string_lossy().into_owned())
         ),
     );
-    assert_success(yaasm(&config, &data, "deploy"));
+    let output = yaasm(&config, &data, "deploy");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Removed: demo"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_success(output);
     assert!(!target.join("demo").exists());
     assert!(fs::symlink_metadata(target.join("demo")).is_err());
 }
@@ -281,7 +300,13 @@ fn deploys_and_updates_git_skill() {
             "two",
         ],
     );
-    assert_success(yaasm(&config, &data, "update"));
+    let output = yaasm(&config, &data, "update");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Updated: demo"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_success(output);
     assert_eq!(
         fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
         "two"

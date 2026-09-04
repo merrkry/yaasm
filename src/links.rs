@@ -53,6 +53,10 @@ pub async fn is_managed(link: &Path, data_dir: &Path) -> Result<bool> {
     Ok(target.is_absolute() && target.starts_with(data_dir))
 }
 
+pub(crate) async fn link_destination(link: &Path) -> Result<Option<PathBuf>> {
+    read_link(link).await
+}
+
 async fn replace_link(link: &Path, destination: &Path) -> Result<()> {
     let parent = link.parent().context("link has no parent directory")?;
     tokio::fs::create_dir_all(parent).await?;
