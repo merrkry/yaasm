@@ -237,6 +237,7 @@ fn deploys_and_updates_git_skill() {
     let first_lock = fs::read_to_string(config.join("lock.toml")).unwrap();
     assert!(first_lock.contains("fingerprint = \"sha256:"));
     assert!(first_lock.contains("revision = "));
+    assert!(!data.join("repos/origin/.git/FETCH_HEAD").exists());
 
     fs::write(repository.join("skills/demo/SKILL.md"), "two").unwrap();
     git(&repository, ["add", "."]);

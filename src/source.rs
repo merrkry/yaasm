@@ -18,6 +18,7 @@ static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 pub struct SourceMaterializer {
     data_dir: PathBuf,
     process_limit: Arc<Semaphore>,
+    ssh_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,9 +29,11 @@ pub struct MaterializedSource {
 
 impl SourceMaterializer {
     pub fn new(data_dir: PathBuf, jobs: u16) -> Self {
+        let ssh_command = multiplexed_ssh_command();
         Self {
             data_dir,
             process_limit: Arc::new(Semaphore::new(usize::from(jobs))),
+            ssh_command,
         }
     }
 
@@ -43,24 +46,25 @@ impl SourceMaterializer {
         paths: &[String],
         rebuild_repository: bool,
     ) -> Result<MaterializedSource> {
-        let repository = self
-            .ensure_repository(name, source, rebuild_repository)
+        let clone_revision = requested_revision.or(source.reference.as_deref());
+        let (repository, cloned) = self
+            .ensure_repository(name, source, clone_revision, rebuild_repository)
             .await?;
-        let revision = match requested_revision {
-            Some(revision) => {
-                self.fetch(&repository, source, Some(revision)).await?;
-                self.git_output(
-                    &repository,
-                    ["rev-parse", &format!("{revision}^{{commit}}")],
-                )
+        let revision = if cloned {
+            self.git_output(&repository, ["rev-parse", "HEAD^{commit}"])
                 .await?
-            }
-            None => {
-                self.fetch(&repository, source, source.reference.as_deref())
-                    .await?;
-                self.git_output(&repository, ["rev-parse", "FETCH_HEAD^{commit}"])
-                    .await?
-            }
+        } else if let Some(revision) = requested_revision {
+            self.fetch(&repository, source, Some(revision)).await?;
+            self.git_output(
+                &repository,
+                ["rev-parse", &format!("{revision}^{{commit}}")],
+            )
+            .await?
+        } else {
+            self.fetch(&repository, source, source.reference.as_deref())
+                .await?;
+            self.git_output(&repository, ["rev-parse", "FETCH_HEAD^{commit}"])
+                .await?
         };
 
         let selected = selected_paths(paths);
@@ -105,11 +109,12 @@ impl SourceMaterializer {
         &self,
         name: &str,
         source: &SourceConfig,
+        revision: Option<&str>,
         rebuild: bool,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, bool)> {
         let repository = self.data_dir.join("repos").join(name);
         if !rebuild && tokio::fs::try_exists(repository.join(".git")).await? {
-            return Ok(repository);
+            return Ok((repository, false));
         }
         if tokio::fs::try_exists(&repository).await? {
             let quarantine = self.staging_path(&format!("repo-{name}"));
@@ -118,16 +123,19 @@ impl SourceMaterializer {
                 .with_context(|| format!("failed to quarantine `{}`", repository.display()))?;
         }
 
+        let mut clone_options = vec!["--filter=blob:none", "--no-checkout", "--depth=1"];
+        let revision_option = revision.map(|revision| format!("--revision={revision}"));
+        clone_options.extend(revision_option.as_deref());
+
         let (kind, configured) = source.kind_and_repository()?;
         if kind == SourceKind::Github && self.gh_authenticated().await {
-            let extra = ["--filter=blob:none", "--no-checkout", "--depth=1"];
             let mut command = Command::new("gh");
             command
                 .arg("repo")
                 .arg("clone")
                 .arg(configured)
                 .arg(&repository);
-            command.arg("--").args(extra);
+            command.arg("--").args(&clone_options);
             self.run(command, "gh repo clone").await?;
         } else {
             let remote = match kind {
@@ -137,12 +145,12 @@ impl SourceMaterializer {
             let mut command = Command::new("git");
             command
                 .arg("clone")
-                .args(["--filter=blob:none", "--no-checkout", "--depth=1"])
+                .args(&clone_options)
                 .arg(remote)
                 .arg(&repository);
             self.run(command, "git clone").await?;
         }
-        Ok(repository)
+        Ok((repository, true))
     }
 
     async fn fetch(
@@ -342,6 +350,9 @@ impl SourceMaterializer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(ssh_command) = &self.ssh_command {
+            command.env("GIT_SSH_COMMAND", ssh_command);
+        }
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start {label}"))?;
@@ -372,6 +383,31 @@ impl SourceMaterializer {
             .join(".staging")
             .join(format!("{prefix}-{}-{id}", std::process::id()))
     }
+}
+
+#[cfg(unix)]
+fn multiplexed_ssh_command() -> Option<String> {
+    if std::env::var_os("GIT_SSH_COMMAND").is_some() {
+        return None;
+    }
+    // Keep this path short: OpenSSH expands %C and adds a temporary suffix while
+    // creating the socket, but Unix socket paths are limited to roughly 100 bytes.
+    let control_path = std::env::temp_dir().join(format!("yaasm-ssh-{}-%C", std::process::id()));
+    let control_path = control_path.to_str()?;
+    Some(format!(
+        "ssh -o ControlMaster=auto -o ControlPersist=30s -o ControlPath={}",
+        shell_quote(control_path)
+    ))
+}
+
+#[cfg(not(unix))]
+fn multiplexed_ssh_command() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn missing_object_ids(output: &str) -> Vec<&str> {
@@ -438,5 +474,11 @@ mod tests {
     fn extracts_only_missing_object_ids() {
         let output = "012345 path/to/file\n?abcdef\n?789012\n";
         assert_eq!(missing_object_ids(output), ["abcdef", "789012"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quotes_ssh_control_paths_for_the_shell() {
+        assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
     }
 }
