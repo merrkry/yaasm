@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{SourceConfig, SourceKind};
 
@@ -18,6 +18,7 @@ static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 pub struct SourceMaterializer {
     data_dir: PathBuf,
     process_limit: Arc<Semaphore>,
+    gh_authenticated: Arc<OnceCell<bool>>,
     ssh_command: Option<String>,
 }
 
@@ -33,6 +34,7 @@ impl SourceMaterializer {
         Self {
             data_dir,
             process_limit: Arc::new(Semaphore::new(usize::from(jobs))),
+            gh_authenticated: Arc::new(OnceCell::new()),
             ssh_command,
         }
     }
@@ -298,9 +300,14 @@ impl SourceMaterializer {
     }
 
     async fn gh_authenticated(&self) -> bool {
-        let mut command = Command::new("gh");
-        command.args(["auth", "status"]);
-        self.run(command, "gh auth status").await.is_ok()
+        *self
+            .gh_authenticated
+            .get_or_init(|| async {
+                let mut command = Command::new("gh");
+                command.args(["auth", "status"]);
+                self.run(command, "gh auth status").await.is_ok()
+            })
+            .await
     }
 
     async fn git_output<I, S>(&self, repository: &Path, arguments: I) -> Result<String>

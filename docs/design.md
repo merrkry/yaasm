@@ -153,7 +153,7 @@ YAASM serializes the complete result after the source-resolution barrier and com
 
 The external `git` command is required. `gh` is optional.
 
-For a GitHub source, YAASM uses `gh repo clone` for the initial clone when `gh` exists and is authenticated. Otherwise it falls back to Git. The clone requests a configured or locked revision directly; an existing cache uses `git fetch` because GitHub CLI has no general fetch operation for this workflow.
+For a GitHub source, YAASM uses `gh repo clone` for the initial clone when `gh` exists and is authenticated. It checks authentication lazily and at most once per run, so existing caches do not invoke `gh`. Otherwise it falls back to Git. The clone requests a configured or locked revision directly; an existing cache uses `git fetch` because GitHub CLI has no general fetch operation for this workflow.
 
 Child processes are non-interactive. YAASM sets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`, while preserving configured credential helpers, SSH agents, and token environment variables. On Unix, it also gives OpenSSH a per-process control socket under the temporary directory so sibling Git commands can reuse connections. An existing `GIT_SSH_COMMAND` takes precedence. YAASM captures and labels child stderr instead of allowing concurrent commands to write directly to the terminal.
 
