@@ -293,29 +293,24 @@ async fn clean_staging(data_dir: &Path) -> Result<()> {
 
 async fn resolve_runtime_paths(config: &Config, paths: &AppPaths) -> Result<RuntimePaths> {
     let home = home_dir()?;
+    let config_value = paths.config_dir.to_string_lossy();
     let mut targets = Vec::new();
     for target in &config.targets {
-        targets.push(absolute_without_parent(&home, target)?);
+        let expanded = expand_config_path(&target.to_string_lossy(), &config_value)
+            .with_context(|| format!("failed to expand target `{}`", target.display()))?;
+        targets.push(
+            absolute_without_parent(&home, &expanded)
+                .with_context(|| format!("invalid expanded target `{}`", target.display()))?,
+        );
     }
 
-    let config_value = paths.config_dir.to_string_lossy().into_owned();
     let mut locals = BTreeMap::new();
     for (name, skill) in &config.skills {
         if skill.source != LOCAL_SOURCE {
             continue;
         }
-        let expanded = shellexpand::env_with_context(&skill.path, |variable| {
-            if variable == "YAASM_CONFIG_DIR" {
-                return Ok::<_, env::VarError>(Some(config_value.clone()));
-            }
-            match env::var(variable) {
-                Ok(value) => Ok(Some(value)),
-                Err(env::VarError::NotPresent) => Ok(None),
-                Err(error) => Err(error),
-            }
-        })
-        .with_context(|| format!("failed to expand local skill `{name}`"))?;
-        let path = PathBuf::from(expanded.as_ref());
+        let path = expand_config_path(&skill.path, &config_value)
+            .with_context(|| format!("failed to expand local skill `{name}`"))?;
         if !path.is_absolute() {
             bail!("expanded path for local skill `{name}` must be absolute");
         }
@@ -342,6 +337,20 @@ async fn resolve_runtime_paths(config: &Config, paths: &AppPaths) -> Result<Runt
     }
 
     Ok(RuntimePaths { targets, locals })
+}
+
+fn expand_config_path(path: &str, config_dir: &str) -> Result<PathBuf> {
+    let expanded = shellexpand::env_with_context(path, |variable| {
+        if variable == "YAASM_CONFIG_DIR" {
+            return Ok::<_, env::VarError>(Some(config_dir.to_owned()));
+        }
+        match env::var(variable) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(error),
+        }
+    })?;
+    Ok(PathBuf::from(expanded.as_ref()))
 }
 
 async fn establish_skill_entries(

@@ -78,7 +78,7 @@ Different config/data pairs are independent. A link into another profile's data 
 version = 1
 targets = [
   ".agents/skills",
-  ".codex/skills",
+  "${YAASM_CONFIG_DIR}/codex-skills",
 ]
 
 [sources.foo]
@@ -108,11 +108,11 @@ Unknown versions, unknown fields, duplicate names, and case-folded name collisio
 
 ### Path rules
 
-Target paths may be absolute or relative to the user's home directory. YAASM creates missing target directories recursively. Targets do not support variable expansion.
+Target paths may be absolute or relative to the user's home directory. YAASM creates missing target directories recursively.
 
 Network skill paths are literal repository-relative paths. They cannot be absolute, contain `..`, or escape the repository.
 
-Only local skill paths use variable expansion. YAASM uses `shellexpand::env_with_context`, which supports `$VAR`, `${VAR}`, and `${VAR:-default}`. YAASM provides `YAASM_CONFIG_DIR`; all other names come from the process environment. Tilde expansion is disabled. The expanded local path must be absolute.
+Target and local skill paths use `shellexpand::env_with_context`, which supports `$VAR`, `${VAR}`, and `${VAR:-default}`. YAASM provides `YAASM_CONFIG_DIR`; all other names come from the process environment. Tilde expansion is disabled. Expanded relative targets remain relative to the user's home directory. An expanded local skill path must be absolute.
 
 Every selected skill directory must contain a regular `SKILL.md` file.
 
