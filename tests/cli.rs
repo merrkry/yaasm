@@ -33,6 +33,32 @@ fn write_config(config_dir: &Path, input: &str) {
 
 #[cfg(unix)]
 #[test]
+fn expands_target_path() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    let local = config.join("local-skill");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("SKILL.md"), "local").unwrap();
+    write_config(
+        &config,
+        r#"version = 1
+targets = ["${YAASM_CONFIG_DIR}/target"]
+[skills.demo]
+source = "local"
+path = "${YAASM_CONFIG_DIR}/local-skill"
+"#,
+    );
+
+    assert_success(yaasm(&config, &data, "deploy"));
+    assert_eq!(
+        fs::read_to_string(config.join("target/demo/SKILL.md")).unwrap(),
+        "local"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn deploys_local_skill_and_cleans_stale_link() {
     let temp = TempDir::new().unwrap();
     let config = temp.path().join("config");
