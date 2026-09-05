@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::config::{SourceConfig, SourceKind};
 
@@ -18,7 +18,6 @@ static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 pub struct SourceMaterializer {
     data_dir: PathBuf,
     process_limit: Arc<Semaphore>,
-    gh_authenticated: Arc<OnceCell<bool>>,
     ssh_command: Option<String>,
 }
 
@@ -34,7 +33,6 @@ impl SourceMaterializer {
         Self {
             data_dir,
             process_limit: Arc::new(Semaphore::new(usize::from(jobs))),
-            gh_authenticated: Arc::new(OnceCell::new()),
             ssh_command,
         }
     }
@@ -130,28 +128,17 @@ impl SourceMaterializer {
         clone_options.extend(revision_option.as_deref());
 
         let (kind, configured) = source.kind_and_repository()?;
-        if kind == SourceKind::Github && self.gh_authenticated().await {
-            let mut command = Command::new("gh");
-            command
-                .arg("repo")
-                .arg("clone")
-                .arg(configured)
-                .arg(&repository);
-            command.arg("--").args(&clone_options);
-            self.run(command, "gh repo clone").await?;
-        } else {
-            let remote = match kind {
-                SourceKind::Git => configured.to_owned(),
-                SourceKind::Github => format!("https://github.com/{configured}.git"),
-            };
-            let mut command = Command::new("git");
-            command
-                .arg("clone")
-                .args(&clone_options)
-                .arg(remote)
-                .arg(&repository);
-            self.run(command, "git clone").await?;
-        }
+        let remote = match kind {
+            SourceKind::Git => configured.to_owned(),
+            SourceKind::Github => format!("https://github.com/{configured}.git"),
+        };
+        let mut command = Command::new("git");
+        command
+            .arg("clone")
+            .args(&clone_options)
+            .arg(remote)
+            .arg(&repository);
+        self.run(command, "git clone").await?;
         Ok((repository, true))
     }
 
@@ -299,17 +286,6 @@ impl SourceMaterializer {
         Ok(())
     }
 
-    async fn gh_authenticated(&self) -> bool {
-        *self
-            .gh_authenticated
-            .get_or_init(|| async {
-                let mut command = Command::new("gh");
-                command.args(["auth", "status"]);
-                self.run(command, "gh auth status").await.is_ok()
-            })
-            .await
-    }
-
     async fn git_output<I, S>(&self, repository: &Path, arguments: I) -> Result<String>
     where
         I: IntoIterator<Item = S>,
@@ -348,7 +324,6 @@ impl SourceMaterializer {
             .context("process limit closed")?;
         command
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GH_PROMPT_DISABLED", "1")
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {

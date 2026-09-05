@@ -2,8 +2,6 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 fn yaasm(config: &Path, data: &Path, command: &str) -> Output {
@@ -353,13 +351,11 @@ fn deploys_and_updates_git_skill() {
 
 #[cfg(unix)]
 #[test]
-fn checks_gh_auth_once_for_concurrent_clones() {
+fn github_sources_use_git_for_clone_and_update() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repository");
     let config = temp.path().join("config");
     let data = temp.path().join("data");
-    let bin = temp.path().join("bin");
-    let log = temp.path().join("gh.log");
 
     fs::create_dir_all(repository.join("skills/demo")).unwrap();
     git(
@@ -381,46 +377,73 @@ fn checks_gh_auth_once_for_concurrent_clones() {
         ],
     );
 
-    fs::create_dir_all(&bin).unwrap();
-    let fake_gh = bin.join("gh");
-    fs::write(
-        &fake_gh,
-        r#"#!/bin/sh
-if [ "$1" = auth ] && [ "$2" = status ]; then
-    printf 'auth\n' >> "$FAKE_GH_LOG"
-    exit 0
-fi
-if [ "$1" = repo ] && [ "$2" = clone ]; then
-    destination=$4
-    shift 5
-    exec git clone "$@" "$FAKE_GH_REPOSITORY" "$destination"
-fi
-exit 2
-"#,
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&fake_gh).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fake_gh, permissions).unwrap();
-
     write_config(
         &config,
         "version = 1\n[sources.one]\ngithub = \"example/one\"\nref = \"main\"\n[sources.two]\ngithub = \"example/two\"\nref = \"main\"\n[skills.one]\nsource = \"one\"\npath = \"skills/demo\"\n[skills.two]\nsource = \"two\"\npath = \"skills/demo\"\n",
     );
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
-        .arg("--config-dir")
-        .arg(&config)
-        .arg("--data-dir")
-        .arg(&data)
-        .arg("deploy")
-        .env("PATH", path)
-        .env("FAKE_GH_LOG", &log)
-        .env("FAKE_GH_REPOSITORY", &repository)
-        .output()
-        .unwrap();
-    assert_success(output);
-    assert_eq!(fs::read_to_string(log).unwrap(), "auth\n");
+    let run = |action: &str| {
+        Command::new(env!("CARGO_BIN_EXE_yaasm"))
+            .arg("--config-dir")
+            .arg(&config)
+            .arg("--data-dir")
+            .arg(&data)
+            .arg(action)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", temp.path().join("empty-gitconfig"))
+            .env("GIT_CONFIG_COUNT", "2")
+            .env(
+                "GIT_CONFIG_KEY_0",
+                format!("url.{}.insteadOf", repository.display()),
+            )
+            .env("GIT_CONFIG_VALUE_0", "https://github.com/example/one.git")
+            .env(
+                "GIT_CONFIG_KEY_1",
+                format!("url.{}.insteadOf", repository.display()),
+            )
+            .env("GIT_CONFIG_VALUE_1", "https://github.com/example/two.git")
+            .output()
+            .unwrap()
+    };
+    assert_success(run("deploy"));
+    for name in ["one", "two"] {
+        assert_eq!(
+            fs::read_to_string(data.join("skills").join(name).join("SKILL.md")).unwrap(),
+            "demo"
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(data.join("repos").join(name))
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("https://github.com/example/{name}.git")
+        );
+        assert_success(output);
+    }
+
+    fs::write(repository.join("skills/demo/SKILL.md"), "updated").unwrap();
+    git(&repository, ["add", "."]);
+    git(
+        &repository,
+        [
+            "-c",
+            "user.name=YAASM Test",
+            "-c",
+            "user.email=yaasm@example.invalid",
+            "commit",
+            "-m",
+            "update",
+        ],
+    );
+    assert_success(run("update"));
+    for name in ["one", "two"] {
+        assert_eq!(
+            fs::read_to_string(data.join("skills").join(name).join("SKILL.md")).unwrap(),
+            "updated"
+        );
+    }
 }
 
 fn git<const N: usize>(directory: &Path, arguments: [&str; N]) {
