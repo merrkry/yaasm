@@ -143,8 +143,8 @@ fn validate_skill_path(name: &str, skill: &SkillConfig) -> Result<()> {
             bail!("local skill `{name}` has an empty path");
         }
     } else {
-        if path.is_absolute() || skill.path.is_empty() {
-            bail!("network skill `{name}` path must be a non-empty relative path");
+        if path.is_absolute() {
+            bail!("network skill `{name}` path must be relative");
         }
         reject_parent_components(path)
             .with_context(|| format!("invalid path for network skill `{name}`"))?;

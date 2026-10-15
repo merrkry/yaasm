@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,15 +54,14 @@ impl SourceMaterializer {
             self.git_output(&repository, ["rev-parse", "HEAD^{commit}"])
                 .await?
         } else if let Some(revision) = requested_revision {
-            self.fetch(&repository, source, Some(revision)).await?;
+            self.fetch(&repository, Some(revision)).await?;
             self.git_output(
                 &repository,
                 ["rev-parse", &format!("{revision}^{{commit}}")],
             )
             .await?
         } else {
-            self.fetch(&repository, source, source.reference.as_deref())
-                .await?;
+            self.fetch(&repository, source.reference.as_deref()).await?;
             self.git_output(&repository, ["rev-parse", "FETCH_HEAD^{commit}"])
                 .await?
         };
@@ -142,27 +141,15 @@ impl SourceMaterializer {
         Ok((repository, true))
     }
 
-    async fn fetch(
-        &self,
-        repository: &Path,
-        source: &SourceConfig,
-        reference: Option<&str>,
-    ) -> Result<()> {
+    async fn fetch(&self, repository: &Path, reference: Option<&str>) -> Result<()> {
+        // Revision clones have no fetch refspec. Always request the intended ref,
+        // including remote HEAD when the source does not configure one.
+        let reference = reference.unwrap_or("HEAD");
         let mut command = self.git(repository);
-        command.arg("fetch").args(["--depth=1", "origin"]);
-        if let Some(reference) = reference {
-            command.arg(reference);
-        }
-        self.run(command, "git fetch").await.with_context(|| {
-            format!(
-                "failed to fetch {}",
-                source
-                    .reference
-                    .as_deref()
-                    .or(reference)
-                    .unwrap_or("remote HEAD")
-            )
-        })
+        command.args(["fetch", "--depth=1", "origin", reference]);
+        self.run(command, "git fetch")
+            .await
+            .with_context(|| format!("failed to fetch {reference}"))
     }
 
     async fn materialize_snapshot(
@@ -228,12 +215,16 @@ impl SourceMaterializer {
             }
         }
         for path in required_paths {
-            let manifest = format!("{path}/SKILL.md");
+            let manifest = Path::new(path)
+                .components()
+                .filter(|component| *component != Component::CurDir)
+                .collect::<PathBuf>()
+                .join("SKILL.md");
             let found = tree.lines().any(|line| {
                 line.starts_with("100")
                     && line
                         .split_once('\t')
-                        .is_some_and(|(_, item)| item == manifest)
+                        .is_some_and(|(_, item)| Path::new(item) == manifest)
             });
             if !found {
                 bail!("`{path}` does not contain a regular tracked SKILL.md");
@@ -353,7 +344,11 @@ impl SourceMaterializer {
             .with_context(|| format!("failed to wait for {label}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("{label} failed: {}", stderr.trim());
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                bail!("{label} failed ({})", output.status);
+            }
+            bail!("{label} failed ({}): {stderr}", output.status);
         }
         String::from_utf8(output.stdout)
             .with_context(|| format!("{label} returned non-UTF-8 output"))
@@ -400,6 +395,12 @@ fn missing_object_ids(output: &str) -> Vec<&str> {
 }
 
 pub fn selected_paths(paths: &[String]) -> Vec<String> {
+    if paths
+        .iter()
+        .any(|path| path.is_empty() || Path::new(path) == Path::new("."))
+    {
+        return vec![".".into()];
+    }
     let unique: BTreeSet<_> = paths.iter().cloned().collect();
     let mut selected = Vec::<String>::new();
     for path in unique {
@@ -442,6 +443,12 @@ mod tests {
             "skills/b".into(),
         ];
         assert_eq!(selected_paths(&paths), ["skills/a", "skills/b"]);
+
+        for root in [".", ""] {
+            let mut paths = paths.clone();
+            paths.push(root.into());
+            assert_eq!(selected_paths(&paths), ["."]);
+        }
     }
 
     #[test]
@@ -456,6 +463,28 @@ mod tests {
     fn extracts_only_missing_object_ids() {
         let output = "012345 path/to/file\n?abcdef\n?789012\n";
         assert_eq!(missing_object_ids(output), ["abcdef", "789012"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_process_reports_status_with_or_without_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let materializer = SourceMaterializer::new(temp.path().to_owned(), 1);
+        for (script, expected) in [
+            ("exit 23", "test command failed (exit status: 23)"),
+            (
+                "printf 'problem\\n' >&2; exit 23",
+                "test command failed (exit status: 23): problem",
+            ),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let error = materializer
+                .output(command, "test command")
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[cfg(unix)]
