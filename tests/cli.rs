@@ -241,17 +241,34 @@ fn locked_deploy_requires_complete_matching_lock() {
 #[cfg(unix)]
 #[test]
 fn deploys_and_updates_git_skill() {
+    deploys_and_updates_git_skill_at_path("skills/demo");
+}
+
+#[cfg(unix)]
+#[test]
+fn deploys_and_updates_git_skill_at_dot_root() {
+    deploys_and_updates_git_skill_at_path(".");
+}
+
+#[cfg(unix)]
+#[test]
+fn deploys_and_updates_git_skill_at_empty_root() {
+    deploys_and_updates_git_skill_at_path("");
+}
+
+#[cfg(unix)]
+fn deploys_and_updates_git_skill_at_path(skill_path: &str) {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repository");
     let config = temp.path().join("config");
     let data = temp.path().join("data");
     let target = temp.path().join("target");
-    fs::create_dir_all(repository.join("skills/demo")).unwrap();
     git(
         temp.path(),
         ["init", "-b", "main", repository.to_str().unwrap()],
     );
-    fs::write(repository.join("skills/demo/SKILL.md"), "one").unwrap();
+    fs::create_dir_all(repository.join(skill_path)).unwrap();
+    fs::write(repository.join(skill_path).join("SKILL.md"), "one").unwrap();
     git(&repository, ["add", "."]);
     git(
         &repository,
@@ -268,9 +285,10 @@ fn deploys_and_updates_git_skill() {
     write_config(
         &config,
         &format!(
-            "version = 1\ntargets = [{}]\n[sources.origin]\ngit = {}\nref = \"main\"\n[skills.demo]\nsource = \"origin\"\npath = \"skills/demo\"\n",
+            "version = 1\ntargets = [{}]\n[sources.origin]\ngit = {}\nref = \"main\"\n[skills.demo]\nsource = \"origin\"\npath = {}\n",
             toml::Value::String(target.to_string_lossy().into_owned()),
-            toml::Value::String(repository.to_string_lossy().into_owned())
+            toml::Value::String(repository.to_string_lossy().into_owned()),
+            toml::Value::String(skill_path.into())
         ),
     );
 
@@ -284,7 +302,7 @@ fn deploys_and_updates_git_skill() {
     assert!(first_lock.contains("revision = "));
     assert!(!data.join("repos/origin/.git/FETCH_HEAD").exists());
 
-    fs::write(repository.join("skills/demo/SKILL.md"), "two").unwrap();
+    fs::write(repository.join(skill_path).join("SKILL.md"), "two").unwrap();
     git(&repository, ["add", "."]);
     git(
         &repository,
@@ -315,12 +333,12 @@ fn deploys_and_updates_git_skill() {
     );
 
     let replacement = temp.path().join("replacement");
-    fs::create_dir_all(replacement.join("skills/demo")).unwrap();
     git(
         temp.path(),
         ["init", "-b", "main", replacement.to_str().unwrap()],
     );
-    fs::write(replacement.join("skills/demo/SKILL.md"), "replacement").unwrap();
+    fs::create_dir_all(replacement.join(skill_path)).unwrap();
+    fs::write(replacement.join(skill_path).join("SKILL.md"), "replacement").unwrap();
     git(&replacement, ["add", "."]);
     git(
         &replacement,
@@ -337,9 +355,10 @@ fn deploys_and_updates_git_skill() {
     write_config(
         &config,
         &format!(
-            "version = 1\ntargets = [{}]\n[sources.origin]\ngit = {}\nref = \"main\"\n[skills.demo]\nsource = \"origin\"\npath = \"skills/demo\"\n",
+            "version = 1\ntargets = [{}]\n[sources.origin]\ngit = {}\nref = \"main\"\n[skills.demo]\nsource = \"origin\"\npath = {}\n",
             toml::Value::String(target.to_string_lossy().into_owned()),
-            toml::Value::String(replacement.to_string_lossy().into_owned())
+            toml::Value::String(replacement.to_string_lossy().into_owned()),
+            toml::Value::String(skill_path.into())
         ),
     );
     assert_success(yaasm(&config, &data, "deploy"));
@@ -347,6 +366,104 @@ fn deploys_and_updates_git_skill() {
         fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
         "replacement"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn updates_remote_head_with_normal_and_revision_cloned_caches() {
+    for rebuild_from_lock in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        let config = temp.path().join("config");
+        let data = temp.path().join("data");
+        fs::create_dir_all(repository.join("skills/demo")).unwrap();
+        git(
+            temp.path(),
+            ["init", "-b", "main", repository.to_str().unwrap()],
+        );
+        fs::write(repository.join("skills/demo/SKILL.md"), "one").unwrap();
+        git(&repository, ["add", "."]);
+        git(
+            &repository,
+            [
+                "-c",
+                "user.name=YAASM Test",
+                "-c",
+                "user.email=yaasm@example.invalid",
+                "commit",
+                "-m",
+                "one",
+            ],
+        );
+        write_config(
+            &config,
+            &format!(
+                "version = 1\n[sources.origin]\ngit = {}\n[skills.demo]\nsource = \"origin\"\npath = \"skills/demo\"\n",
+                toml::Value::String(repository.to_string_lossy().into_owned())
+            ),
+        );
+        assert_success(yaasm(&config, &data, "deploy"));
+        let first_lock = fs::read_to_string(config.join("lock.toml")).unwrap();
+
+        if rebuild_from_lock {
+            fs::remove_dir_all(data.join("repos")).unwrap();
+            fs::remove_dir_all(data.join("snapshots")).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
+                .arg("--config-dir")
+                .arg(&config)
+                .arg("--data-dir")
+                .arg(&data)
+                .args(["deploy", "--locked"])
+                .output()
+                .unwrap();
+            assert_success(output);
+            assert_eq!(
+                first_lock,
+                fs::read_to_string(config.join("lock.toml")).unwrap()
+            );
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(data.join("repos/origin"))
+                .args(["config", "--get", "remote.origin.fetch"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+        }
+
+        // Changing the default branch must not leave an unpinned source on main.
+        git(&repository, ["checkout", "-b", "next"]);
+        fs::write(repository.join("skills/demo/SKILL.md"), "two").unwrap();
+        git(&repository, ["add", "."]);
+        git(
+            &repository,
+            [
+                "-c",
+                "user.name=YAASM Test",
+                "-c",
+                "user.email=yaasm@example.invalid",
+                "commit",
+                "-m",
+                "two",
+            ],
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
+            .arg("--config-dir")
+            .arg(&config)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["update", "origin"])
+            .output()
+            .unwrap();
+        assert_success(output);
+        assert_eq!(
+            fs::read_to_string(data.join("skills/demo/SKILL.md")).unwrap(),
+            "two"
+        );
+        assert_ne!(
+            first_lock,
+            fs::read_to_string(config.join("lock.toml")).unwrap()
+        );
+    }
 }
 
 #[cfg(unix)]

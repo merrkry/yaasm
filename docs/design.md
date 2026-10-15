@@ -111,6 +111,7 @@ Unknown versions, unknown fields, duplicate names, and case-folded name collisio
 Target paths may be absolute or relative to the user's home directory. YAASM creates missing target directories recursively.
 
 Network skill paths are literal repository-relative paths. They cannot be absolute, contain `..`, or escape the repository.
+Both `path = "."` and `path = ""` select the repository root.
 
 Target and local skill paths use `shellexpand::env_with_context`, which supports `$VAR`, `${VAR}`, and `${VAR:-default}`. YAASM provides `YAASM_CONFIG_DIR`; all other names come from the process environment. Tilde expansion is disabled. Expanded relative targets remain relative to the user's home directory. An expanded local skill path must be absolute.
 
