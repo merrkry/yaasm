@@ -11,6 +11,7 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::config::{SourceConfig, SourceKind};
+use crate::paths::simplified;
 
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -136,7 +137,7 @@ impl SourceMaterializer {
             .arg("clone")
             .args(&clone_options)
             .arg(remote)
-            .arg(&repository);
+            .arg(simplified(&repository));
         self.run(command, "git clone").await?;
         Ok((repository, true))
     }
@@ -181,7 +182,7 @@ impl SourceMaterializer {
 
         let mut command = self.git(repository);
         command
-            .arg(format!("--work-tree={}", staging.display()))
+            .arg(format!("--work-tree={}", simplified(&staging).display()))
             .args(["checkout", "--force", revision, "--"])
             .args(selected_paths);
         if let Err(error) = self.run(command, "git checkout").await {
@@ -290,7 +291,7 @@ impl SourceMaterializer {
 
     fn git(&self, repository: &Path) -> Command {
         let mut command = Command::new("git");
-        command.arg("-C").arg(repository);
+        command.arg("-C").arg(simplified(repository));
         command
     }
 
