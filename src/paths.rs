@@ -74,6 +74,30 @@ pub fn simplified(path: &Path) -> &Path {
     path
 }
 
+pub async fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("path has no existing ancestor")?,
+                );
+                ancestor = ancestor.parent().context("path has no parent")?;
+            }
+            Err(error) => return Err(error).context("failed to resolve path"),
+        }
+    }
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {

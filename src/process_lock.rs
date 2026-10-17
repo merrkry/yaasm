@@ -10,10 +10,17 @@ pub struct ProcessLocks {
 
 impl ProcessLocks {
     pub fn acquire(config_dir: &Path, data_dir: &Path) -> Result<Self> {
-        let mut paths = [
+        Self::acquire_paths(vec![
             config_dir.join(".process.lock"),
             data_dir.join(".process.lock"),
-        ];
+        ])
+    }
+
+    pub fn acquire_data(data_dir: &Path) -> Result<Self> {
+        Self::acquire_paths(vec![data_dir.join(".process.lock")])
+    }
+
+    fn acquire_paths(mut paths: Vec<PathBuf>) -> Result<Self> {
         paths.sort();
 
         let mut files = Vec::with_capacity(paths.len());

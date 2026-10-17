@@ -8,6 +8,7 @@ use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
+use crate::bundle::Bundle;
 use crate::cli::{Cli, Command};
 use crate::config::{Config, LOCAL_SOURCE};
 use crate::links::{
@@ -15,7 +16,10 @@ use crate::links::{
 };
 use crate::lockfile::{LockedSource, Lockfile, fingerprint};
 use crate::output::{Output, SkillChange};
-use crate::paths::{AppPaths, absolute_without_parent, home_dir, reject_overlap, simplified};
+use crate::paths::{
+    AppPaths, absolute_without_parent, canonicalize_with_missing, home_dir, reject_overlap,
+    simplified,
+};
 use crate::process_lock::ProcessLocks;
 use crate::source::{MaterializedSource, SourceMaterializer};
 
@@ -53,30 +57,164 @@ pub async fn run(cli: Cli) -> Result<()> {
 async fn run_inner(cli: Cli, output: &Output) -> Result<()> {
     output.phase("Preparing workspace");
     let mut paths = AppPaths::resolve(cli.config_dir, cli.data_dir)?;
-    tokio::fs::create_dir_all(&paths.config_dir).await?;
-    tokio::fs::create_dir_all(&paths.data_dir).await?;
+    let read_only_config = matches!(
+        cli.command,
+        Command::Bundle { .. }
+            | Command::Deploy {
+                bundle: Some(_),
+                ..
+            }
+    );
+    if !read_only_config {
+        tokio::fs::create_dir_all(&paths.config_dir).await?;
+    }
     paths.config_dir = tokio::fs::canonicalize(&paths.config_dir).await?;
-    paths.data_dir = tokio::fs::canonicalize(&paths.data_dir).await?;
+    paths.data_dir = canonicalize_with_missing(&paths.data_dir).await?;
     reject_overlap(&paths.config_dir, &paths.data_dir)?;
-    let _locks = ProcessLocks::acquire(&paths.config_dir, &paths.data_dir)?;
+    let bundle_root = if let Command::Deploy {
+        bundle: Some(root), ..
+    } = &cli.command
+    {
+        let root = tokio::fs::canonicalize(root)
+            .await
+            .context("failed to open bundle directory")?;
+        reject_overlap(&root, &paths.data_dir)?;
+        Some(root)
+    } else {
+        None
+    };
+    tokio::fs::create_dir_all(&paths.data_dir).await?;
+    paths.data_dir = tokio::fs::canonicalize(&paths.data_dir).await?;
+    let _locks = if read_only_config {
+        ProcessLocks::acquire_data(&paths.data_dir)?
+    } else {
+        ProcessLocks::acquire(&paths.config_dir, &paths.data_dir)?
+    };
     initialize_data_dir(&paths.data_dir).await?;
     clean_staging(&paths.data_dir).await?;
 
     output.phase("Reading configuration");
     let config = Config::load(&paths.config_dir.join("config.toml")).await?;
     let runtime = if matches!(cli.command, Command::Deploy { .. }) {
-        Some(resolve_runtime_paths(&config, &paths).await?)
+        Some(resolve_runtime_paths(&config, &paths, bundle_root.as_deref()).await?)
     } else {
         None
     };
     let mut lock = Lockfile::load_if_exists(&paths.config_dir.join("lock.toml")).await?;
 
-    let (locked, forced) = command_policy(&cli.command, &config)?;
-    let materializer = SourceMaterializer::new(paths.data_dir.clone(), cli.jobs);
-    let paths_by_source = network_paths(&config);
+    if let Command::Bundle {
+        output: destination,
+    } = &cli.command
+    {
+        validate_locked(&config, &lock)?;
+        let destination = absolute_without_parent(&env::current_dir()?, destination)?;
+        let parent = tokio::fs::canonicalize(
+            destination
+                .parent()
+                .context("bundle output has no parent")?,
+        )
+        .await?;
+        let destination = parent.join(
+            destination
+                .file_name()
+                .context("bundle output has no name")?,
+        );
+        reject_overlap(&destination, &paths.config_dir)?;
+        reject_overlap(&destination, &paths.data_dir)?;
+        output.phase("Building remote bundle");
+        let materializer = SourceMaterializer::new(paths.data_dir.clone(), cli.jobs);
+        Bundle::build(&destination, &config, &lock, &materializer).await?;
+        output.finish();
+        println!("Bundle written to {}", destination.display());
+        return Ok(());
+    }
+
+    let (ready, mut errors) = if let Some(root) = &bundle_root {
+        validate_locked(&config, &lock)?;
+        let bundle = Bundle::load(root, &config, &lock).await?;
+        let mut ready = BTreeMap::new();
+        let mut errors = Vec::new();
+        output.phase("Importing remote bundle (offline)");
+        for name in bundle.source_names() {
+            match bundle.import_source(root, &paths.data_dir, name).await {
+                Ok(source) => {
+                    ready.insert(name.clone(), source);
+                }
+                Err(error) => errors.push(format!("source `{name}`: {error:#}")),
+            }
+        }
+        (ready, errors)
+    } else {
+        prepare_sources(&config, &paths, &mut lock, &cli.command, cli.jobs, output).await?
+    };
+    if matches!(cli.command, Command::Update { .. }) {
+        output.finish();
+        for (name, skill) in &config.skills {
+            if skill.source != LOCAL_SOURCE && !config.sources.contains_key(&skill.source) {
+                errors.push(format!("skill `{name}`: unknown source `{}`", skill.source));
+            }
+        }
+        if !errors.is_empty() {
+            errors.sort();
+            bail!("{}", errors.join("\n"));
+        }
+        println!("Sources updated");
+        return Ok(());
+    }
+    let runtime = runtime.context("deployment paths were not resolved")?;
+
+    output.phase(format!("Deploying {} skills", config.skills.len()));
+    let skill_results = establish_skill_entries(&config, &runtime, &paths, &ready).await;
+    for (name, result) in &skill_results {
+        if let Err(error) = result {
+            errors.push(format!("skill `{name}`: {error:#}"));
+        }
+    }
+
+    let targets_clean =
+        deploy_targets(&config, &runtime, &paths, &skill_results, &mut errors).await;
+    let mut removed = BTreeSet::new();
+    if targets_clean && errors.is_empty() {
+        output.phase("Cleaning up");
+        removed = clean_data(&config, &paths, &ready).await?;
+    }
+
+    if errors.is_empty() {
+        let mut added = BTreeSet::new();
+        let mut updated = BTreeSet::new();
+        for (name, result) in skill_results {
+            match result? {
+                SkillChange::Added => {
+                    added.insert(name);
+                }
+                SkillChange::Updated => {
+                    updated.insert(name);
+                }
+                SkillChange::Unchanged => {}
+            }
+        }
+        output.summary(&added, &updated, &removed);
+        Ok(())
+    } else {
+        errors.sort();
+        bail!("{}", errors.join("\n"));
+    }
+}
+
+async fn prepare_sources(
+    config: &Config,
+    paths: &AppPaths,
+    lock: &mut Lockfile,
+    command: &Command,
+    jobs: u16,
+    output: &Output,
+) -> Result<(BTreeMap<String, MaterializedSource>, Vec<String>)> {
+    let (locked, forced) = command_policy(command, config)?;
+    let materializer = SourceMaterializer::new(paths.data_dir.clone(), jobs);
+    let paths_by_source = network_paths(config);
 
     if locked {
-        validate_locked(&config, &lock)?;
+        validate_locked(config, lock)?;
     }
 
     output.phase("Resolving sources");
@@ -195,63 +333,13 @@ async fn run_inner(cli: Cli, output: &Output) -> Result<()> {
         write_lock(&paths.config_dir.join("lock.toml"), lock.to_toml()?).await?;
     }
 
-    if matches!(cli.command, Command::Update { .. }) {
-        output.finish();
-        for (name, skill) in &config.skills {
-            if skill.source != LOCAL_SOURCE && !config.sources.contains_key(&skill.source) {
-                errors.push(format!("skill `{name}`: unknown source `{}`", skill.source));
-            }
-        }
-        if !errors.is_empty() {
-            errors.sort();
-            bail!("{}", errors.join("\n"));
-        }
-        println!("Sources updated");
-        return Ok(());
-    }
-    let runtime = runtime.context("deployment paths were not resolved")?;
-
-    output.phase(format!("Deploying {} skills", config.skills.len()));
-    let skill_results = establish_skill_entries(&config, &runtime, &paths, &ready).await;
-    for (name, result) in &skill_results {
-        if let Err(error) = result {
-            errors.push(format!("skill `{name}`: {error:#}"));
-        }
-    }
-
-    let targets_clean =
-        deploy_targets(&config, &runtime, &paths, &skill_results, &mut errors).await;
-    let mut removed = BTreeSet::new();
-    if targets_clean && errors.is_empty() {
-        output.phase("Cleaning up");
-        removed = clean_data(&config, &paths, &ready).await?;
-    }
-
-    if errors.is_empty() {
-        let mut added = BTreeSet::new();
-        let mut updated = BTreeSet::new();
-        for (name, result) in skill_results {
-            match result? {
-                SkillChange::Added => {
-                    added.insert(name);
-                }
-                SkillChange::Updated => {
-                    updated.insert(name);
-                }
-                SkillChange::Unchanged => {}
-            }
-        }
-        output.summary(&added, &updated, &removed);
-        Ok(())
-    } else {
-        errors.sort();
-        bail!("{}", errors.join("\n"));
-    }
+    Ok((ready, errors))
 }
 
 fn command_policy(command: &Command, config: &Config) -> Result<(bool, BTreeSet<String>)> {
     match command {
-        Command::Deploy { locked } => Ok((*locked, BTreeSet::new())),
+        Command::Deploy { locked, .. } => Ok((*locked, BTreeSet::new())),
+        Command::Bundle { .. } => Ok((true, BTreeSet::new())),
         Command::Update { sources } => {
             let forced = if sources.is_empty() {
                 config.sources.keys().cloned().collect()
@@ -345,7 +433,11 @@ async fn clean_staging(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_runtime_paths(config: &Config, paths: &AppPaths) -> Result<RuntimePaths> {
+async fn resolve_runtime_paths(
+    config: &Config,
+    paths: &AppPaths,
+    bundle: Option<&Path>,
+) -> Result<RuntimePaths> {
     let home = home_dir()?;
     let config_value = simplified(&paths.config_dir).to_string_lossy();
     let mut targets = Vec::new();
@@ -379,10 +471,11 @@ async fn resolve_runtime_paths(config: &Config, paths: &AppPaths) -> Result<Runt
     for internal in ["repos", "snapshots", "skills", ".staging"] {
         pool.push(paths.data_dir.join(internal));
     }
+    if let Some(bundle) = bundle {
+        pool.push(bundle.to_owned());
+    }
     for path in &mut pool {
-        if tokio::fs::try_exists(&path).await? {
-            *path = tokio::fs::canonicalize(&path).await?;
-        }
+        *path = canonicalize_with_missing(path).await?;
     }
     for left in 0..pool.len() {
         for right in (left + 1)..pool.len() {
