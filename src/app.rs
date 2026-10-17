@@ -10,10 +10,12 @@ use tokio::task::JoinSet;
 
 use crate::cli::{Cli, Command};
 use crate::config::{Config, LOCAL_SOURCE};
-use crate::links::{clean_target, establish_owned_link, establish_placement, link_destination};
+use crate::links::{
+    clean_target, establish_owned_link, establish_placement, link_destination, remove_link,
+};
 use crate::lockfile::{LockedSource, Lockfile, fingerprint};
 use crate::output::{Output, SkillChange};
-use crate::paths::{AppPaths, absolute_without_parent, home_dir, reject_overlap};
+use crate::paths::{AppPaths, absolute_without_parent, home_dir, reject_overlap, simplified};
 use crate::process_lock::ProcessLocks;
 use crate::source::{MaterializedSource, SourceMaterializer};
 
@@ -325,7 +327,7 @@ async fn clean_staging(data_dir: &Path) -> Result<()> {
 
 async fn resolve_runtime_paths(config: &Config, paths: &AppPaths) -> Result<RuntimePaths> {
     let home = home_dir()?;
-    let config_value = paths.config_dir.to_string_lossy();
+    let config_value = simplified(&paths.config_dir).to_string_lossy();
     let mut targets = Vec::new();
     for target in &config.targets {
         let expanded = expand_config_path(&target.to_string_lossy(), &config_value)
@@ -435,7 +437,9 @@ async fn establish_skill_entry(link: &Path, destination: &Path) -> Result<SkillC
     establish_owned_link(link, destination).await?;
     Ok(match previous {
         None => SkillChange::Added,
-        Some(previous) if previous == destination => SkillChange::Unchanged,
+        Some(previous) if simplified(&previous) == simplified(destination) => {
+            SkillChange::Unchanged
+        }
         Some(_) => SkillChange::Updated,
     })
 }
@@ -536,7 +540,9 @@ async fn clean_named_children(
             continue;
         }
         let file_type = entry.file_type().await?;
-        if file_type.is_dir() && !file_type.is_symlink() {
+        if link_destination(&entry.path()).await?.is_some() {
+            remove_link(&entry.path()).await?;
+        } else if file_type.is_dir() {
             tokio::fs::remove_dir_all(entry.path()).await?;
         } else {
             tokio::fs::remove_file(entry.path()).await?;

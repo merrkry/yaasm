@@ -67,6 +67,13 @@ pub fn reject_overlap(left: &Path, right: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn simplified(path: &Path) -> &Path {
+    #[cfg(windows)]
+    return dunce::simplified(path);
+    #[cfg(not(windows))]
+    path
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {

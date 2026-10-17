@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 fn yaasm(config: &Path, data: &Path, command: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_yaasm"))
+        .env("HOME", config.parent().unwrap())
         .arg("--config-dir")
         .arg(config)
         .arg("--data-dir")
@@ -15,6 +16,7 @@ fn yaasm(config: &Path, data: &Path, command: &str) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)]
 fn assert_success(output: Output) {
     assert!(
         output.status.success(),
@@ -90,7 +92,7 @@ fn deploys_local_skill_and_cleans_stale_link() {
     assert_success(yaasm(&config, &data, "deploy"));
     assert_eq!(
         fs::read_link(target.join("demo")).unwrap(),
-        data.join("skills/demo")
+        fs::canonicalize(&data).unwrap().join("skills/demo")
     );
     assert_eq!(
         fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
@@ -222,6 +224,7 @@ fn locked_deploy_requires_complete_matching_lock() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
+        .env("HOME", temp.path())
         .arg("--config-dir")
         .arg(&config)
         .arg("--data-dir")
@@ -563,6 +566,7 @@ fn github_sources_use_git_for_clone_and_update() {
     }
 }
 
+#[cfg(unix)]
 fn git<const N: usize>(directory: &Path, arguments: [&str; N]) {
     let output = Command::new("git")
         .current_dir(directory)

@@ -143,7 +143,11 @@ fn validate_skill_path(name: &str, skill: &SkillConfig) -> Result<()> {
             bail!("local skill `{name}` has an empty path");
         }
     } else {
-        if path.is_absolute() {
+        if path.has_root()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::Prefix(_)))
+        {
             bail!("network skill `{name}` path must be relative");
         }
         reject_parent_components(path)
@@ -211,5 +215,20 @@ path = "../bar"
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("`..`"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_rooted_and_drive_relative_network_paths() {
+        for path in ["/skills/demo", "C:skills/demo"] {
+            let input =
+                format!("version = 1\n[skills.demo]\nsource = \"remote\"\npath = {path:?}\n");
+            assert!(
+                parse(&input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must be relative")
+            );
+        }
     }
 }
