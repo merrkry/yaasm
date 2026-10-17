@@ -21,9 +21,18 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Deploy {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bundle")]
         locked: bool,
+        /// Deploy strictly offline from a previously built remote bundle.
+        #[arg(long)]
+        bundle: Option<PathBuf>,
     },
     /// Update remote sources and the lockfile without deploying skills.
     Update { sources: Vec<String> },
+    /// Build a portable remote bundle from the current lockfile.
+    Bundle {
+        /// Publish to a new directory. The lockfile is never changed.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
