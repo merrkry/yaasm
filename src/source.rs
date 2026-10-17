@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::config::{SourceConfig, SourceKind};
+use crate::paths::simplified;
 
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -25,6 +26,12 @@ pub struct SourceMaterializer {
 pub struct MaterializedSource {
     pub revision: String,
     pub snapshot: Option<PathBuf>,
+}
+
+pub struct TrackedFile {
+    pub path: String,
+    pub mode: String,
+    pub sha256: String,
 }
 
 impl SourceMaterializer {
@@ -46,25 +53,9 @@ impl SourceMaterializer {
         paths: &[String],
         rebuild_repository: bool,
     ) -> Result<MaterializedSource> {
-        let clone_revision = requested_revision.or(source.reference.as_deref());
-        let (repository, cloned) = self
-            .ensure_repository(name, source, clone_revision, rebuild_repository)
+        let (repository, revision) = self
+            .resolve_repository(name, source, requested_revision, rebuild_repository)
             .await?;
-        let revision = if cloned {
-            self.git_output(&repository, ["rev-parse", "HEAD^{commit}"])
-                .await?
-        } else if let Some(revision) = requested_revision {
-            self.fetch(&repository, Some(revision)).await?;
-            self.git_output(
-                &repository,
-                ["rev-parse", &format!("{revision}^{{commit}}")],
-            )
-            .await?
-        } else {
-            self.fetch(&repository, source.reference.as_deref()).await?;
-            self.git_output(&repository, ["rev-parse", "FETCH_HEAD^{commit}"])
-                .await?
-        };
 
         let selected = selected_paths(paths);
         let required: Vec<_> = paths
@@ -90,6 +81,36 @@ impl SourceMaterializer {
         Ok(MaterializedSource { revision, snapshot })
     }
 
+    async fn resolve_repository(
+        &self,
+        name: &str,
+        source: &SourceConfig,
+        requested_revision: Option<&str>,
+        rebuild_repository: bool,
+    ) -> Result<(PathBuf, String)> {
+        let clone_revision = requested_revision.or(source.reference.as_deref());
+        let (repository, cloned) = self
+            .ensure_repository(name, source, clone_revision, rebuild_repository)
+            .await?;
+        let revision = if cloned {
+            self.git_output(&repository, ["rev-parse", "HEAD^{commit}"])
+                .await?
+        } else if let Some(revision) = requested_revision {
+            self.fetch(&repository, Some(revision)).await?;
+            self.git_output(
+                &repository,
+                ["rev-parse", &format!("{revision}^{{commit}}")],
+            )
+            .await?
+        } else {
+            self.fetch(&repository, source.reference.as_deref()).await?;
+            self.git_output(&repository, ["rev-parse", "FETCH_HEAD^{commit}"])
+                .await?
+        };
+
+        Ok((repository, revision))
+    }
+
     pub fn snapshot_path(
         &self,
         fingerprint: &str,
@@ -104,6 +125,114 @@ impl SourceMaterializer {
         })
     }
 
+    /// Export locked blobs as SHA-256 objects in an existing writable directory.
+    /// Contents and recorded modes are independent of Git checkout settings.
+    /// This operation may access the network.
+    pub async fn export_locked_tree(
+        &self,
+        name: &str,
+        source: &SourceConfig,
+        revision: &str,
+        paths: &[String],
+        objects_dir: &Path,
+    ) -> Result<Vec<TrackedFile>> {
+        let (repository, resolved) = self
+            .resolve_repository(name, source, Some(revision), false)
+            .await?;
+        if resolved != revision {
+            bail!("resolved revision does not match lockfile");
+        }
+        let selected = selected_paths(paths);
+        self.prefetch_missing_objects(&repository, revision, &selected)
+            .await?;
+        let mut command = self.git(&repository);
+        command
+            .args(["ls-tree", "-r", "-z", revision, "--"])
+            .args(&selected);
+        let tree = self
+            .output_bytes_with_input(command, "git ls-tree", None)
+            .await?;
+        let mut entries = Vec::new();
+        let mut objects = String::new();
+        for entry in tree
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let entry = std::str::from_utf8(entry).context("bundle paths must be UTF-8")?;
+            let (header, path) = entry.split_once('\t').context("invalid Git tree entry")?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            if fields.len() != 3 || !matches!(fields[0], "100644" | "100755" | "120000") {
+                bail!("unsupported Git tree entry `{path}`");
+            }
+            objects.push_str(fields[2]);
+            objects.push('\n');
+            entries.push((path.to_owned(), fields[0].to_owned()));
+        }
+        self.export_blobs(&repository, &objects, entries, objects_dir)
+            .await
+    }
+
+    async fn export_blobs(
+        &self,
+        repository: &Path,
+        objects: &str,
+        entries: Vec<(String, String)>,
+        objects_dir: &Path,
+    ) -> Result<Vec<TrackedFile>> {
+        let mut command = self.git(repository);
+        command.args(["cat-file", "--batch"]);
+        let (_permit, mut child) = self.start(command, "git cat-file", true).await?;
+        let mut stdin = child.stdin.take().context("missing Git stdin")?;
+        let stdout = child.stdout.take().context("missing Git stdout")?;
+        let write = async move { stdin.write_all(objects.as_bytes()).await };
+        let read = async move {
+            let mut reader = BufReader::new(stdout);
+            let mut files = Vec::new();
+            let mut buffer = vec![0; 64 * 1024];
+            for (index, (path, mode)) in entries.into_iter().enumerate() {
+                let mut header = String::new();
+                reader.read_line(&mut header).await?;
+                let fields: Vec<_> = header.split_whitespace().collect();
+                if fields.len() != 3 || fields[1] != "blob" {
+                    bail!("invalid Git blob header `{}`", header.trim());
+                }
+                let mut remaining: u64 = fields[2].parse()?;
+                let temporary = objects_dir.join(format!(".blob-{index}"));
+                let mut file = tokio::fs::File::create_new(&temporary).await?;
+                let mut hasher = Sha256::new();
+                while remaining > 0 {
+                    let length = remaining.min(buffer.len() as u64) as usize;
+                    let count = reader.read(&mut buffer[..length]).await?;
+                    if count == 0 {
+                        bail!("truncated Git blob for `{path}`");
+                    }
+                    file.write_all(&buffer[..count]).await?;
+                    hasher.update(&buffer[..count]);
+                    remaining -= count as u64;
+                }
+                if reader.read_u8().await? != b'\n' {
+                    bail!("invalid Git blob separator");
+                }
+                file.flush().await?;
+                drop(file);
+                let sha256 = hex::encode(hasher.finalize());
+                let destination = objects_dir.join(&sha256);
+                if tokio::fs::try_exists(&destination).await? {
+                    tokio::fs::remove_file(&temporary).await?;
+                } else {
+                    tokio::fs::rename(&temporary, destination).await?;
+                }
+                files.push(TrackedFile { path, mode, sha256 });
+            }
+            Ok::<_, anyhow::Error>(files)
+        };
+        let (written, files, output) = tokio::join!(write, read, child.wait_with_output());
+        let output = output.context("failed to wait for git cat-file")?;
+        checked_output(output, "git cat-file")?;
+        written.context("failed to write Git object requests")?;
+        files
+    }
+
     async fn ensure_repository(
         &self,
         name: &str,
@@ -112,8 +241,34 @@ impl SourceMaterializer {
         rebuild: bool,
     ) -> Result<(PathBuf, bool)> {
         let repository = self.data_dir.join("repos").join(name);
+        let (kind, configured) = source.kind_and_repository()?;
+        let remote = match kind {
+            SourceKind::Git => configured.to_owned(),
+            SourceKind::Github => format!("https://github.com/{configured}.git"),
+        };
         if !rebuild && tokio::fs::try_exists(repository.join(".git")).await? {
-            return Ok((repository, false));
+            let origin = self
+                .git_output(
+                    &repository,
+                    ["config", "--get", "--default", "", "remote.origin.url"],
+                )
+                .await?;
+            let local_path = remote
+                .split_once(':')
+                .is_none_or(|(prefix, _)| prefix.contains('/'))
+                || matches!(
+                    Path::new(&remote).components().next(),
+                    Some(Component::Prefix(_))
+                );
+            // Git records relative local clone origins against the working directory.
+            let matches = if local_path {
+                Path::new(&origin) == std::env::current_dir()?.join(&remote)
+            } else {
+                origin == remote
+            };
+            if matches {
+                return Ok((repository, false));
+            }
         }
         if tokio::fs::try_exists(&repository).await? {
             let quarantine = self.staging_path(&format!("repo-{name}"));
@@ -126,17 +281,12 @@ impl SourceMaterializer {
         let revision_option = revision.map(|revision| format!("--revision={revision}"));
         clone_options.extend(revision_option.as_deref());
 
-        let (kind, configured) = source.kind_and_repository()?;
-        let remote = match kind {
-            SourceKind::Git => configured.to_owned(),
-            SourceKind::Github => format!("https://github.com/{configured}.git"),
-        };
         let mut command = Command::new("git");
         command
             .arg("clone")
             .args(&clone_options)
             .arg(remote)
-            .arg(&repository);
+            .arg(simplified(&repository));
         self.run(command, "git clone").await?;
         Ok((repository, true))
     }
@@ -181,7 +331,7 @@ impl SourceMaterializer {
 
         let mut command = self.git(repository);
         command
-            .arg(format!("--work-tree={}", staging.display()))
+            .arg(format!("--work-tree={}", simplified(&staging).display()))
             .args(["checkout", "--force", revision, "--"])
             .args(selected_paths);
         if let Err(error) = self.run(command, "git checkout").await {
@@ -290,7 +440,7 @@ impl SourceMaterializer {
 
     fn git(&self, repository: &Path) -> Command {
         let mut command = Command::new("git");
-        command.arg("-C").arg(repository);
+        command.arg("-C").arg(simplified(repository));
         command
     }
 
@@ -304,18 +454,52 @@ impl SourceMaterializer {
 
     async fn output_with_input(
         &self,
-        mut command: Command,
+        command: Command,
         label: &str,
         input: Option<&[u8]>,
     ) -> Result<String> {
-        let _permit = self
+        let bytes = self.output_bytes_with_input(command, label, input).await?;
+        String::from_utf8(bytes).with_context(|| format!("{label} returned non-UTF-8 output"))
+    }
+
+    async fn output_bytes_with_input(
+        &self,
+        command: Command,
+        label: &str,
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let (_permit, mut child) = self.start(command, label, input.is_some()).await?;
+        let stdin = child.stdin.take();
+        let write = async {
+            if let Some(input) = input {
+                stdin
+                    .context("failed to open child stdin")?
+                    .write_all(input)
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        let output = output.with_context(|| format!("failed to wait for {label}"))?;
+        let bytes = checked_output(output, label)?;
+        written.with_context(|| format!("failed to write to {label}"))?;
+        Ok(bytes)
+    }
+
+    async fn start(
+        &self,
+        mut command: Command,
+        label: &str,
+        has_input: bool,
+    ) -> Result<(tokio::sync::SemaphorePermit<'_>, tokio::process::Child)> {
+        let permit = self
             .process_limit
             .acquire()
             .await
             .context("process limit closed")?;
         command
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(if input.is_some() {
+            .stdin(if has_input {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -326,32 +510,10 @@ impl SourceMaterializer {
         if let Some(ssh_command) = &self.ssh_command {
             command.env("GIT_SSH_COMMAND", ssh_command);
         }
-        let mut child = command
+        let child = command
             .spawn()
             .with_context(|| format!("failed to start {label}"))?;
-        if let Some(input) = input {
-            child
-                .stdin
-                .take()
-                .context("failed to open child stdin")?
-                .write_all(input)
-                .await
-                .with_context(|| format!("failed to write to {label}"))?;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .with_context(|| format!("failed to wait for {label}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                bail!("{label} failed ({})", output.status);
-            }
-            bail!("{label} failed ({}): {stderr}", output.status);
-        }
-        String::from_utf8(output.stdout)
-            .with_context(|| format!("{label} returned non-UTF-8 output"))
+        Ok((permit, child))
     }
 
     fn staging_path(&self, prefix: &str) -> PathBuf {
@@ -360,6 +522,18 @@ impl SourceMaterializer {
             .join(".staging")
             .join(format!("{prefix}-{}-{id}", std::process::id()))
     }
+}
+
+fn checked_output(output: std::process::Output, label: &str) -> Result<Vec<u8>> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("{label} failed ({})", output.status);
+        }
+        bail!("{label} failed ({}): {stderr}", output.status);
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(unix)]

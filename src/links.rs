@@ -2,23 +2,27 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::paths::simplified;
 use anyhow::{Context, Result, bail};
 
 static LINK_ID: AtomicU64 = AtomicU64::new(0);
 
 pub async fn establish_owned_link(link: &Path, destination: &Path) -> Result<()> {
-    if let Ok(metadata) = tokio::fs::symlink_metadata(link).await
-        && !is_link(&metadata.file_type())
-    {
-        bail!("YAASM data entry `{}` is not a link", link.display());
+    match tokio::fs::symlink_metadata(link).await {
+        Ok(_) if read_link(link).await?.is_none() => {
+            bail!("YAASM data entry `{}` is not a link", link.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect data entry"),
     }
     replace_link(link, destination).await
 }
 
 pub async fn establish_placement(link: &Path, destination: &Path, data_dir: &Path) -> Result<()> {
     match tokio::fs::symlink_metadata(link).await {
-        Ok(metadata) => {
-            if !is_link(&metadata.file_type()) || !is_managed(link, data_dir).await? {
+        Ok(_) => {
+            if !is_managed(link, data_dir).await? {
                 bail!("target entry `{}` is not managed by YAASM", link.display());
             }
         }
@@ -50,7 +54,7 @@ pub async fn is_managed(link: &Path, data_dir: &Path) -> Result<bool> {
     let Some(target) = read_link(link).await? else {
         return Ok(false);
     };
-    Ok(target.is_absolute() && target.starts_with(data_dir))
+    Ok(target.is_absolute() && simplified(&target).starts_with(simplified(data_dir)))
 }
 
 pub(crate) async fn link_destination(link: &Path) -> Result<Option<PathBuf>> {
@@ -89,52 +93,38 @@ async fn create_link(destination: PathBuf, link: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 async fn read_link(link: &Path) -> Result<Option<PathBuf>> {
+    #[cfg(windows)]
+    const ERROR_NOT_A_REPARSE_POINT: i32 = 4390;
+
     match tokio::fs::read_link(link).await {
         Ok(target) => Ok(Some(target)),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("failed to read symbolic link"),
-    }
-}
-
-#[cfg(windows)]
-async fn read_link(link: &Path) -> Result<Option<PathBuf>> {
-    let owned = link.to_owned();
-    match tokio::task::spawn_blocking(move || junction::get_target(owned)).await? {
-        Ok(target) => Ok(Some(target)),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error).context("failed to read junction"),
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT) => Ok(None),
+        Err(error) => Err(error).context("failed to read link"),
     }
 }
 
 #[cfg(unix)]
-async fn remove_link(link: &Path) -> Result<()> {
+pub(crate) async fn remove_link(link: &Path) -> Result<()> {
     tokio::fs::remove_file(link)
         .await
         .with_context(|| format!("failed to remove link `{}`", link.display()))
 }
 
 #[cfg(windows)]
-async fn remove_link(link: &Path) -> Result<()> {
-    let owned = link.to_owned();
-    tokio::task::spawn_blocking(move || junction::delete(owned))
-        .await
-        .context("junction task failed")??;
-    Ok(())
-}
+pub(crate) async fn remove_link(link: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
 
-fn is_link(file_type: &std::fs::FileType) -> bool {
-    #[cfg(unix)]
-    return file_type.is_symlink();
-    #[cfg(windows)]
-    return file_type.is_symlink() || file_type.is_dir();
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    let metadata = tokio::fs::symlink_metadata(link).await?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        // RemoveDirectory removes the junction itself without changing its target.
+        tokio::fs::remove_dir(link).await?;
+    } else {
+        tokio::fs::remove_file(link).await?;
+    }
+    Ok(())
 }

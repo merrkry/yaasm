@@ -14,13 +14,13 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn resolve(config_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Result<Self> {
         let current_dir = env::current_dir().context("failed to get current directory")?;
-        let home = home_dir()?;
         let (config_dir, data_dir) = match (config_dir, data_dir) {
             (Some(config), Some(data)) => (
                 absolute_without_parent(&current_dir, &config)?,
                 absolute_without_parent(&current_dir, &data)?,
             ),
             (None, None) => {
+                let home = home_dir()?;
                 let config_base = env::var_os("XDG_CONFIG_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| home.join(".config"));
@@ -65,6 +65,37 @@ pub fn reject_overlap(left: &Path, right: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn simplified(path: &Path) -> &Path {
+    #[cfg(windows)]
+    return dunce::simplified(path);
+    #[cfg(not(windows))]
+    path
+}
+
+pub async fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("path has no existing ancestor")?,
+                );
+                ancestor = ancestor.parent().context("path has no parent")?;
+            }
+            Err(error) => return Err(error).context("failed to resolve path"),
+        }
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
