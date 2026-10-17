@@ -15,13 +15,17 @@ The v1 commands are:
 ```console
 yaasm deploy
 yaasm deploy --locked
+yaasm deploy --bundle ./remote-bundle
+yaasm bundle --output ./remote-bundle
 yaasm update
 yaasm update foo bar
 ```
 
-`deploy` fills missing or stale lock entries, then reconciles data entries and targets. `deploy --locked` forbids lock changes.
+`deploy` fills missing or stale lock entries, then reconciles data entries and targets. `deploy --locked` forbids lock changes and may use the network. `deploy --bundle DIR` deploys from a [remote bundle](#remote-bundles). `--bundle` and `--locked` are mutually exclusive.
 
 `update` resolves every declared network source and commits the lockfile without deploying. Source arguments restrict the forced updates to those names. Local sources cannot be update arguments. The command validates selected network skills before committing a revision, without resolving local paths or targets or cleaning deployed content. Run `deploy` to apply the updated versions.
+
+`bundle --output DIR` always requires a matching lockfile, including entries for unused sources. It never updates that lockfile. It may fetch locked Git contents. The output must be absent and its parent directory must exist. The output cannot overlap the configuration or data directory. A failed build leaves the output unpublished. The caller owns the output and must serialize writes to it.
 
 The global options are:
 
@@ -66,7 +70,7 @@ data-dir/
 
 `root.toml` contains the data layout version. YAASM initializes a missing or empty data directory. It refuses to take ownership of a non-empty directory without a supported marker. A marker from a newer format also causes a global error.
 
-The configuration and data directories must be different and cannot contain each other. YAASM uses the system's default permissions and ACL inheritance. It does not rewrite permissions on existing files or directories.
+The configuration and data directories must be different and cannot contain each other. YAASM uses the system's default permissions and ACL inheritance for its workspace and links. Bundle objects and manifests have mode 0644 on Unix, with directories at 0755. Imported files restore Git executable bits with mode 0755 or 0644. Existing published content is immutable.
 
 Different config/data pairs are independent. A link into another profile's data directory is not managed by the current invocation and causes a normal collision if it uses a desired name.
 
@@ -117,7 +121,7 @@ Target and local skill paths use `shellexpand::env_with_context`, which supports
 
 Every selected skill directory must contain a regular `SKILL.md` file.
 
-YAASM compares target roots, local skill roots, and the internal `repos`, `snapshots`, `skills`, and `.staging` roots as one path set. No two entries may be equal or contain each other. Existing paths are canonicalized before comparison. Missing targets use normalized absolute paths. This also forbids two local skill names from referring to the same directory.
+YAASM compares target roots, local skill roots, and the internal `repos`, `snapshots`, `skills`, and `.staging` roots as one path set. No two entries may be equal or contain each other. Existing paths are canonicalized before comparison. Missing paths resolve their nearest existing ancestor before appending the missing components. Offline deployment forbids any overlap between the bundle root and the data directory, local skill roots, or targets. This also forbids two local skill names from referring to the same directory.
 
 ## Lockfile
 
@@ -152,11 +156,9 @@ YAASM serializes the complete result after the source-resolution barrier and com
 
 ## Network sources
 
-The external `git` command is required. `gh` is optional.
+Online source preparation requires external Git with `git clone --revision` support. GitHub sources use Git over HTTPS. The clone requests a configured or locked revision directly; an existing cache uses `git fetch`.
 
-For a GitHub source, YAASM uses `gh repo clone` for the initial clone when `gh` exists and is authenticated. It checks authentication lazily and at most once per run, so existing caches do not invoke `gh`. Otherwise it falls back to Git. The clone requests a configured or locked revision directly; an existing cache uses `git fetch` because GitHub CLI has no general fetch operation for this workflow.
-
-Child processes are non-interactive. YAASM sets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`, while preserving configured credential helpers, SSH agents, and token environment variables. On Unix, it also gives OpenSSH a per-process control socket under the temporary directory so sibling Git commands can reuse connections. An existing `GIT_SSH_COMMAND` takes precedence. YAASM captures and labels child stderr instead of allowing concurrent commands to write directly to the terminal.
+Child processes are non-interactive. YAASM sets `GIT_TERMINAL_PROMPT=0`, while preserving configured credential helpers, SSH agents, and token environment variables. On Unix, it also gives OpenSSH a per-process control socket under the temporary directory so sibling Git commands can reuse connections. An existing `GIT_SSH_COMMAND` takes precedence. YAASM captures and labels child stderr instead of allowing concurrent commands to write directly to the terminal.
 
 Repository caches use shallow, blobless partial clones. Fetches request only the needed ref at depth one. Snapshot materialization fetches the blobs needed by the configured paths. Git handles servers that do not support partial clone.
 
@@ -170,6 +172,7 @@ The repository cache is disposable:
 
 - A missing cache is cloned.
 - A path that is not a valid Git repository is moved into staging and rebuilt.
+- A cache whose origin differs from the configured repository is moved into staging and rebuilt.
 - An object-corruption error fails the source update. YAASM does not reinterpret network, authentication, or ref failures as cache corruption.
 
 ## Snapshots
@@ -224,6 +227,48 @@ Sources are siblings. A failure in one source does not roll back another success
 
 `deploy` proceeds with deployment even after partial source failures. `update` ends after source preparation and the lock commit. A source update is complete when the lock commit succeeds; later deployment failures do not roll it back.
 
+## Remote bundles
+
+A bundle contains selected network skills and their locked identities. Local skills and targets are excluded. Construction does not expand deployment environment variables, inspect local skill directories, or touch targets. The same remote configuration and lockfile produce the same bundle file bytes and Unix modes across build locations.
+
+The directory format is versioned independently of the configuration and lockfile:
+
+```text
+remote-bundle/
+  bundle.toml
+  objects/<sha256>
+```
+
+`bundle.toml` contains these sorted maps:
+
+- `sources.<name>.locked`: the source fingerprint and locked revision, including unused sources.
+- `sources.<name>.files.<repository-relative-path>`: `kind` (`file`, `executable`, or `symlink`) and the object's lowercase hexadecimal `sha256` digest.
+- `skills.<name>`: the network source name and normalized repository-relative path. The empty path selects the repository root.
+
+All objects are regular files. File objects contain raw Git blob bytes; symlink objects contain the original link target bytes. Git checkout filters, line-ending conversion, and the build machine's symlink support do not affect the format. Repository URLs are represented by fingerprints rather than copied into the manifest. Bundle metadata contains no absolute build paths, timestamps, or deployment links.
+
+Selected trees must have regular tracked `SKILL.md` files and no Git submodules. Bundle paths use UTF-8 and forward slashes. YAASM rejects parent components, Windows reserved names and filename characters, trailing dots or spaces, ASCII case conflicts, and files used as parent directories. Invalid paths fail the build rather than being renamed. The destination filesystem can impose further filename and path-length restrictions; restoration errors fail the source. Git LFS pointers remain pointer files.
+
+### Offline import and lifetime
+
+`deploy --bundle DIR` deploys strictly offline without invoking child processes or changing the lockfile. It reads the deployment machine's current configuration and lockfile. The source names, fingerprints, revisions, and network skill names and paths must match the manifest exactly. Local skills and targets may differ between machines or invocations. Unsupported format versions and identity mismatches stop deployment globally before changing skill links. Missing or stale lock entries also fail; YAASM never resolves them from a remote.
+
+For each source, YAASM validates its file map, reads every referenced object, and verifies its SHA-256 digest. This check runs even when a previous import exists. A missing object, invalid path, corrupt object, or unsupported symlink fails that source without network recovery. Other sources and live local skills can still deploy. Failed skills retain their previous links, and the existing target cleanup barriers and data cleanup ordering apply.
+
+YAASM imports remote contents into immutable snapshots in its data directory. It treats the bundle as a read-only input. After successful deployment, the caller may move or delete the bundle without breaking deployed skills. Every later `deploy --bundle` invocation still requires its bundle input. The caller owns bundle storage, transport, and removal. Forced process termination during construction can leave a `.yaasm-bundle-*` directory beside the requested output. The caller may remove this unpublished content.
+
+The manifest is trusted metadata, not a signature or proof of origin. Object hashes detect damaged payloads but do not authenticate their origin. Callers must leave published data snapshots unchanged.
+
+### Symlinks and Windows
+
+Unix imports preserve upstream symlink target bytes verbatim and restore executable bits. Relative links retain their repository layout. Absolute links and links outside selected trees can depend on files outside the bundle; YAASM does not rewrite or dereference them. Their destinations must exist on the deployment machine if the skill needs them.
+
+Windows import rejects sources containing upstream symlinks. Regular skill contents import without symlink privileges. Git executable metadata has no Unix mode equivalent on Windows.
+
+### Read-only inputs
+
+Configuration and bundle inputs may be read-only, including paths in a Nix store. The data directory must be writable. Callers must keep inputs stable as specified under [Concurrency and interruption](#concurrency-and-interruption). YAASM has no Nix runtime dependency. The [sandbox build instructions](../README.md#use-immutable-build-inputs) use separate input and workspace directories.
+
 ## Deployment
 
 Deployment first establishes each stable data entry:
@@ -251,7 +296,7 @@ An existing skill keeps its last working data and target links when a new config
 
 Each target has a cleanup barrier. YAASM removes stale managed links from a target only if every configured placement for that target succeeded in the current run. This includes broken and oddly named links into the current data directory.
 
-YAASM cleans stale data entries, snapshots, and repository caches only after every current target completes its placement and cleanup step. Until then it retains old content. `.staging` is different: YAASM owns it and may clean abandoned work while holding both process locks.
+YAASM cleans stale data entries, snapshots, and repository caches only after every current target completes its placement and cleanup step. Until then it retains old content. `.staging` is different: YAASM owns it and may clean abandoned work while holding the data directory lock.
 
 Targets removed from configuration are not scanned or remembered. The user must clean their old YAASM links manually.
 
@@ -268,7 +313,7 @@ YAASM completes structural preflight before starting network or link work. TOML 
 
 Errors that belong to a source, skill, or placement stay on that branch. Examples include network failure, an unknown source referenced by one skill, a missing skill path, a missing `SKILL.md`, and a collision in one target.
 
-The command prints progress as tasks finish and sorts its final summary by name. Child-process output has a size limit. Any failure produces a nonzero result even when sibling work succeeded.
+The command prints progress as tasks finish and sorts its final summary by name. Any failure produces a nonzero result even when sibling work succeeded.
 
 Exit codes are:
 
@@ -281,28 +326,14 @@ Exit codes are:
 
 ## Concurrency and interruption
 
-YAASM uses a Tokio multi-thread runtime. Independent futures run as tasks. A semaphore limits active Git and gh process trees to `--jobs`, which defaults to four. Snapshot creation is one directory-level task, not one task per file.
+YAASM uses a Tokio multi-thread runtime. Independent futures run as tasks. A semaphore limits active Git child processes to `--jobs`, which defaults to four. Snapshot creation is one directory-level task, not one task per file.
 
 Placement work may run concurrently. Directory scans and cleanup run after their target barriers. Lock sorting, serialization, and writing run after the source barrier.
 
-YAASM takes non-blocking exclusive OS file locks on `.process.lock` in the configuration and data directories. It orders the normalized paths before acquiring them. If either `std::fs::File::try_lock` call reports contention, YAASM drops any acquired lock and exits. Lock files persist, but their presence does not mean a process owns the lock. Closing the handles releases the kernel locks. This requires Rust 1.89 or newer.
+All commands take a non-blocking exclusive OS lock on the data directory. `deploy`, including `--locked`, and `update` also lock the configuration directory. `bundle` and `deploy --bundle` read configuration and lockfile without locking or modifying their directory, so callers must keep inputs stable during these commands. Contention causes the command to fail before source or link work. The files named `.process.lock` persist after their locks are released; their presence alone does not indicate a running process.
 
-Git and gh run in Unix process groups or Windows Job Objects through `process-wrap`. On the first Ctrl-C, YAASM stops new work, cancels tasks waiting for permits, terminates active process trees, skips later commit and cleanup barriers, drops both file locks, and exits with 130. The next invocation removes abandoned staging data. A second Ctrl-C exits immediately.
+On Ctrl-C, the CLI exits with 130 and releases its file locks. Termination of child processes and their descendants is not guaranteed. The next invocation removes abandoned data staging contents.
 
 ## Tests
 
-CI runs on Linux, macOS, and Windows. Integration tests use temporary config, data, and target directories plus local bare Git remotes. They do not depend on public network access or a real GitHub account. A fake `gh` executable verifies arguments, fallback, and non-interactive environment variables.
-
-The required tests cover:
-
-- Stable config parsing, fingerprinting, and sorted lock output
-- Empty configurations and `--locked`
-- Source process limits and future concurrency
-- Source, skill, and placement failure isolation
-- Snapshot identity and reuse after path-set changes
-- Ctrl-C process-tree termination and lock integrity
-- Unix symlinks and Windows junctions
-- Target cleanup barriers and data cleanup ordering
-- Paired process locks
-- Local expansion and path overlap checks
-- Repeated deployment without changes
+CI runs formatting, Clippy, and tests on Linux, macOS, and Windows. Integration tests use temporary directories and local Git repositories without public network access or a GitHub account. Offline tests remove Git from PATH or replace Git and gh with failing sentinels.
