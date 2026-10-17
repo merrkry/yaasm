@@ -64,7 +64,11 @@ async fn run_inner(cli: Cli, output: &Output) -> Result<()> {
 
     output.phase("Reading configuration");
     let config = Config::load(&paths.config_dir.join("config.toml")).await?;
-    let runtime = resolve_runtime_paths(&config, &paths).await?;
+    let runtime = if matches!(cli.command, Command::Deploy { .. }) {
+        Some(resolve_runtime_paths(&config, &paths).await?)
+    } else {
+        None
+    };
     let mut lock = Lockfile::load_if_exists(&paths.config_dir.join("lock.toml")).await?;
 
     let (locked, forced) = command_policy(&cli.command, &config)?;
@@ -190,6 +194,22 @@ async fn run_inner(cli: Cli, output: &Output) -> Result<()> {
             .retain(|name, _| config.sources.contains_key(name));
         write_lock(&paths.config_dir.join("lock.toml"), lock.to_toml()?).await?;
     }
+
+    if matches!(cli.command, Command::Update { .. }) {
+        output.finish();
+        for (name, skill) in &config.skills {
+            if skill.source != LOCAL_SOURCE && !config.sources.contains_key(&skill.source) {
+                errors.push(format!("skill `{name}`: unknown source `{}`", skill.source));
+            }
+        }
+        if !errors.is_empty() {
+            errors.sort();
+            bail!("{}", errors.join("\n"));
+        }
+        println!("Sources updated");
+        return Ok(());
+    }
+    let runtime = runtime.context("deployment paths were not resolved")?;
 
     output.phase(format!("Deploying {} skills", config.skills.len()));
     let skill_results = establish_skill_entries(&config, &runtime, &paths, &ready).await;

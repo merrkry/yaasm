@@ -21,7 +21,7 @@ yaasm update foo bar
 
 `deploy` fills missing or stale lock entries, then reconciles data entries and targets. `deploy --locked` forbids lock changes.
 
-`update` resolves every declared network source. Source arguments restrict the forced updates to those names. After source resolution, it runs the same deployment phase as `deploy`. Local sources cannot be update arguments.
+`update` resolves every declared network source and commits the lockfile without deploying. Source arguments restrict the forced updates to those names. Local sources cannot be update arguments. The command validates selected network skills before committing a revision, without resolving local paths or targets or cleaning deployed content. Run `deploy` to apply the updated versions.
 
 The global options are:
 
@@ -222,7 +222,7 @@ A revision is deployable only if all skills that reference the source pass these
 
 Sources are siblings. A failure in one source does not roll back another successful source. After every source task finishes, YAASM sorts the final entries and writes the lock once.
 
-Regardless of partial source failures, YAASM then runs deployment. A source update is complete when the lock commit succeeds; later deployment failures do not roll it back.
+`deploy` proceeds with deployment even after partial source failures. `update` ends after source preparation and the lock commit. A source update is complete when the lock commit succeeds; later deployment failures do not roll it back.
 
 ## Deployment
 

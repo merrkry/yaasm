@@ -24,7 +24,6 @@ pub enum Command {
         #[arg(long)]
         locked: bool,
     },
-    Update {
-        sources: Vec<String>,
-    },
+    /// Update remote sources and the lockfile without deploying skills.
+    Update { sources: Vec<String> },
 }

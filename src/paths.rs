@@ -14,13 +14,13 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn resolve(config_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Result<Self> {
         let current_dir = env::current_dir().context("failed to get current directory")?;
-        let home = home_dir()?;
         let (config_dir, data_dir) = match (config_dir, data_dir) {
             (Some(config), Some(data)) => (
                 absolute_without_parent(&current_dir, &config)?,
                 absolute_without_parent(&current_dir, &data)?,
             ),
             (None, None) => {
+                let home = home_dir()?;
                 let config_base = env::var_os("XDG_CONFIG_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| home.join(".config"));
