@@ -1,4 +1,5 @@
 pub mod app;
+mod bundle;
 pub mod cli;
 pub mod config;
 pub mod links;

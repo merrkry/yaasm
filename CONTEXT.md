@@ -36,6 +36,10 @@ _Avoid_: Package, plugin
 A logically immutable partial source tree containing the configured skill paths at a network source's locked revision. Its identity covers the source, revision, and selected paths; each skill data entry points to its directory within the shared tree.
 _Avoid_: Checkout, installation
 
+**Bundle**:
+A portable, caller-owned collection of selected network skill contents and their locked identities. It excludes local skills and targets and supplies network sources for offline deployment.
+_Avoid_: Deployment, snapshot
+
 **Target**:
 A user directory in which declared skills are made available to an agent tool.
 _Avoid_: Install directory, destination
@@ -61,5 +65,5 @@ The resolution, validation, and materialization of a network source followed by 
 _Avoid_: Deployment, installation
 
 **Deployment**:
-The reconciliation of skill data entries and target placements with the configuration and lockfile. It follows source-resolution attempts as a separate phase and cannot roll back successful updates.
+The reconciliation of skill data entries and target placements with the configuration and lockfile. The `deploy` command performs it after source-resolution attempts and cannot roll back successful updates. The `update` command prepares sources without deployment.
 _Avoid_: Update, installation

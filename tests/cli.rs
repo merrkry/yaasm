@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 fn yaasm(config: &Path, data: &Path, command: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_yaasm"))
+        .env("HOME", config.parent().unwrap())
         .arg("--config-dir")
         .arg(config)
         .arg("--data-dir")
@@ -27,6 +28,42 @@ fn assert_success(output: Output) {
 fn write_config(config_dir: &Path, input: &str) {
     fs::create_dir_all(config_dir).unwrap();
     fs::write(config_dir.join("config.toml"), input).unwrap();
+}
+
+#[test]
+fn update_ignores_deployment_paths_and_preserves_existing_links() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    let local = config.join("live");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("SKILL.md"), "live").unwrap();
+    write_config(
+        &config,
+        "version = 1\ntargets = [\"${YAASM_CONFIG_DIR}/target\"]\n[skills.demo]\nsource = \"local\"\npath = \"${YAASM_CONFIG_DIR}/live\"\n",
+    );
+    assert_success(yaasm(&config, &data, "update"));
+    assert!(!config.join("target").exists());
+    assert!(!data.join("skills/demo").exists());
+    assert_success(yaasm(&config, &data, "deploy"));
+    write_config(
+        &config,
+        "version = 1\ntargets = [\"${YAASM_CONFIG_DIR}/target\"]\n",
+    );
+    assert_success(yaasm(&config, &data, "update"));
+    assert_eq!(
+        fs::read_to_string(config.join("target/demo/SKILL.md")).unwrap(),
+        "live"
+    );
+    write_config(
+        &config,
+        "version = 1\ntargets = [\"${YAASM_CONFIG_DIR}/live/target\"]\n[skills.demo]\nsource = \"local\"\npath = \"${YAASM_CONFIG_DIR}/live\"\n",
+    );
+    assert_success(yaasm(&config, &data, "update"));
+    assert!(!local.join("target").exists());
+    fs::remove_file(local.join("SKILL.md")).unwrap();
+    assert_success(yaasm(&config, &data, "update"));
+    assert!(fs::symlink_metadata(data.join("skills/demo")).is_ok());
 }
 
 #[cfg(unix)]
@@ -90,7 +127,7 @@ fn deploys_local_skill_and_cleans_stale_link() {
     assert_success(yaasm(&config, &data, "deploy"));
     assert_eq!(
         fs::read_link(target.join("demo")).unwrap(),
-        data.join("skills/demo")
+        fs::canonicalize(&data).unwrap().join("skills/demo")
     );
     assert_eq!(
         fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
@@ -222,6 +259,7 @@ fn locked_deploy_requires_complete_matching_lock() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_yaasm"))
+        .env("HOME", temp.path())
         .arg("--config-dir")
         .arg(&config)
         .arg("--data-dir")
@@ -316,7 +354,16 @@ fn deploys_and_updates_git_skill_at_path(skill_path: &str) {
             "two",
         ],
     );
-    let output = yaasm(&config, &data, "update");
+    assert_success(yaasm(&config, &data, "update"));
+    assert_eq!(
+        fs::read_to_string(target.join("demo/SKILL.md")).unwrap(),
+        "one"
+    );
+    assert_ne!(
+        first_lock,
+        fs::read_to_string(config.join("lock.toml")).unwrap()
+    );
+    let output = yaasm(&config, &data, "deploy");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("Updated: demo"),
         "{}",
@@ -457,6 +504,11 @@ fn updates_remote_head_with_normal_and_revision_cloned_caches() {
         assert_success(output);
         assert_eq!(
             fs::read_to_string(data.join("skills/demo/SKILL.md")).unwrap(),
+            "one"
+        );
+        assert_success(yaasm(&config, &data, "deploy"));
+        assert_eq!(
+            fs::read_to_string(data.join("skills/demo/SKILL.md")).unwrap(),
             "two"
         );
         assert_ne!(
@@ -558,11 +610,19 @@ fn github_sources_use_git_for_clone_and_update() {
     for name in ["one", "two"] {
         assert_eq!(
             fs::read_to_string(data.join("skills").join(name).join("SKILL.md")).unwrap(),
+            "demo"
+        );
+    }
+    assert_success(run("deploy"));
+    for name in ["one", "two"] {
+        assert_eq!(
+            fs::read_to_string(data.join("skills").join(name).join("SKILL.md")).unwrap(),
             "updated"
         );
     }
 }
 
+#[cfg(unix)]
 fn git<const N: usize>(directory: &Path, arguments: [&str; N]) {
     let output = Command::new("git")
         .current_dir(directory)
