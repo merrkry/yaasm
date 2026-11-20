@@ -626,7 +626,7 @@ fn bundle_manifest_errors_and_input_overlap_never_write_to_the_bundle() {
     let original = fs::read_to_string(bundle.join("bundle.toml")).unwrap();
     fs::write(
         bundle.join("bundle.toml"),
-        original.replacen("version = 1", "version = 999", 1),
+        original.replacen("version = 2", "version = 999", 1),
     )
     .unwrap();
     failure(
