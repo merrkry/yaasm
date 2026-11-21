@@ -87,7 +87,7 @@ path = "${YAASM_CONFIG_DIR}/local-skill"
 
     let output = yaasm(&config, &data, "deploy");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Added: demo"),
+        String::from_utf8_lossy(&output.stdout).contains("+ demo\n"),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -144,7 +144,7 @@ fn deploys_local_skill_and_cleans_stale_link() {
     );
     let output = yaasm(&config, &data, "deploy");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Removed: demo"),
+        String::from_utf8_lossy(&output.stdout).contains("- demo\n"),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -365,7 +365,7 @@ fn deploys_and_updates_git_skill_at_path(skill_path: &str) {
     );
     let output = yaasm(&config, &data, "deploy");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Updated: demo"),
+        String::from_utf8_lossy(&output.stdout).contains("~ demo\n"),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
