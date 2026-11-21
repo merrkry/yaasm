@@ -100,6 +100,14 @@ path = "skills/bar"
 [skills.bar2]
 source = "local"
 path = "${YAASM_CONFIG_DIR}/skills/bar2"
+
+[[collections]]
+source = "foo"
+paths = ["skills/*", "!skills/draft-*"]
+
+[[collections]]
+source = "local"
+paths = ["${YAASM_CONFIG_DIR}/local-skills/*"]
 ```
 
 Each source has exactly one of `github` or `git`. `github` uses `owner/repo` syntax. `ref` is optional and defaults to the remote HEAD. YAASM passes ref resolution to Git or the remote instead of defining its own branch and tag precedence.
@@ -108,16 +116,18 @@ Each source has exactly one of `github` or `git`. `github` uses `owner/repo` syn
 
 The configuration key under `[skills]` is the skill name. It is also the entry name under `data-dir/skills` and every target. Source and skill names must match `[A-Za-z0-9][A-Za-z0-9._-]*`. Names are unique under ASCII case folding on all platforms.
 
-Unknown versions, unknown fields, duplicate names, and case-folded name collisions are global configuration errors.
+`[[collections]]` discovers skills dynamically from a network source or `local`. Each collection declares `source` and a non-empty `paths` array of glob patterns with at least one positive pattern. Patterns starting with `!` negate matching paths in order (gitignore style), so later positive patterns can re-include an excluded path. Patterns are compiled segment by segment (`/` is always a literal path separator; `**` matches zero or more path segments; each other segment is a standard `globset` pattern with backslash escaping disabled, so brace alternations cannot span `/`—use separate entries in `paths` instead). Every selected directory that contains a regular `SKILL.md` becomes a skill named after its final directory component. A collection whose positive patterns match no skill directory fails. Discovered names must satisfy the same naming rules and cannot collide (including under ASCII case folding) with explicit `[skills]` entries or other discovered skills.
+
+Unknown versions, unknown fields, duplicate names, case-folded name collisions, empty or negation-only collection `paths`, and invalid remote glob syntax are global configuration errors. Local collection glob syntax is validated during deployment after environment variable expansion.
 
 ### Path rules
 
 Target paths may be absolute or relative to the user's home directory. YAASM creates missing target directories recursively.
 
 Network skill paths are literal repository-relative paths. They cannot be absolute, contain `..`, or escape the repository.
-Both `path = "."` and `path = ""` select the repository root.
+Both `path = "."` and `path = ""` select the repository root. Network collection patterns (after stripping an optional leading `!`) must be relative, use `/` separators, contain no `..`, and cannot select the repository root.
 
-Target and local skill paths use `shellexpand::env_with_context`, which supports `$VAR`, `${VAR}`, and `${VAR:-default}`. YAASM provides `YAASM_CONFIG_DIR`; all other names come from the process environment. Tilde expansion is disabled. Expanded relative targets remain relative to the user's home directory. An expanded local skill path must be absolute.
+Target, local skill, and local collection paths use `shellexpand::env_with_context`, which supports `$VAR`, `${VAR}`, and `${VAR:-default}`. YAASM provides `YAASM_CONFIG_DIR`; all other names come from the process environment. Tilde expansion is disabled. Expanded relative targets remain relative to the user's home directory. Expanded local skill and local collection paths must be absolute.
 
 Every selected skill directory must contain a regular `SKILL.md` file.
 
@@ -223,15 +233,15 @@ Each source task:
 
 A revision is deployable only if all skills that reference the source pass these checks. A failed source keeps its old lock entry. If that entry's fingerprint still matches the current declaration, deployment may continue with the old revision. A mismatched old entry cannot supply the changed source, so its downstream skills keep their previous links and report failures.
 
-Sources are siblings. A failure in one source does not roll back another successful source. After every source task finishes, YAASM sorts the final entries and writes the lock once.
+Sources are siblings, and unrelated sources continue independently. If two resolved sources discover the same skill name from collections, YAASM reports the conflict, skips updating or deploying those conflicting sources, and exits nonzero. Collection resolution is intentionally non-transactional: when a collection fails or conflicts, YAASM reports the error, skips stale cleanup, and exits nonzero rather than attempting multi-source rollback or cross-collection ownership tracking. After every source task finishes, YAASM sorts the final entries and writes the lock once.
 
-`deploy` proceeds with deployment even after partial source failures. `update` ends after source preparation and the lock commit. A source update is complete when the lock commit succeeds; later deployment failures do not roll it back.
+`deploy` proceeds with deployment even after partial source failures. `update` ends after source preparation and the lock commit, reporting each updated or newly locked revision and any added, moved, or removed collection skills relative to the previous locked revision. A source update is complete when the lock commit succeeds; later deployment failures do not roll it back.
 
 ## Remote bundles
 
-A bundle contains selected network skills and their locked identities. Local skills and targets are excluded. Construction does not expand deployment environment variables, inspect local skill directories, or touch targets. The same remote configuration and lockfile produce the same bundle file bytes and Unix modes across build locations.
+A bundle contains selected network skills and their locked identities. Local skills, local collections, and targets are excluded. Construction does not expand deployment environment variables, inspect local skill directories, or touch targets. The same remote configuration and lockfile produce the same bundle file bytes and Unix modes across build locations.
 
-The directory format is versioned independently of the configuration and lockfile:
+The directory format is versioned independently of the configuration and lockfile (currently version 2):
 
 ```text
 remote-bundle/
@@ -239,11 +249,12 @@ remote-bundle/
   objects/<sha256>
 ```
 
-`bundle.toml` contains these sorted maps:
+`bundle.toml` contains `version`, `selection_fingerprint`, and these sorted maps:
 
+- `selection_fingerprint`: SHA-256 digest of the canonicalized remote explicit skills and remote collections from `config.toml`.
 - `sources.<name>.locked`: the source fingerprint and locked revision, including unused sources.
 - `sources.<name>.files.<repository-relative-path>`: `kind` (`file`, `executable`, or `symlink`) and the object's lowercase hexadecimal `sha256` digest.
-- `skills.<name>`: the network source name and normalized repository-relative path. The empty path selects the repository root.
+- `skills.<name>`: the resolved network source name and normalized repository-relative path for both explicit and collection-discovered remote skills. The empty path selects the repository root.
 
 All objects are regular files. File objects contain raw Git blob bytes; symlink objects contain the original link target bytes. Git checkout filters, line-ending conversion, and the build machine's symlink support do not affect the format. Repository URLs are represented by fingerprints rather than copied into the manifest. Bundle metadata contains no absolute build paths, timestamps, or deployment links.
 
@@ -251,13 +262,13 @@ Selected trees must have regular tracked `SKILL.md` files and no Git submodules.
 
 ### Offline import and lifetime
 
-`deploy --bundle DIR` deploys strictly offline without invoking child processes or changing the lockfile. It reads the deployment machine's current configuration and lockfile. The source names, fingerprints, revisions, and network skill names and paths must match the manifest exactly. Local skills and targets may differ between machines or invocations. Unsupported format versions and identity mismatches stop deployment globally before changing skill links. Missing or stale lock entries also fail; YAASM never resolves them from a remote.
+`deploy --bundle DIR` deploys strictly offline without invoking child processes or changing the lockfile. It reads the deployment machine's current configuration and lockfile. The source names, fingerprints, revisions, and remote selection fingerprint must match the manifest exactly. Local skills, local collections, and targets may differ between machines or invocations. Unsupported format versions and identity mismatches stop deployment globally before changing skill links. Missing or stale lock entries also fail; YAASM never resolves them from a remote.
 
 For each source, YAASM validates its file map, reads every referenced object, and verifies its SHA-256 digest. This check runs even when a previous import exists. A missing object, invalid path, corrupt object, or unsupported symlink fails that source without network recovery. Other sources and live local skills can still deploy. Failed skills retain their previous links, and the existing target cleanup barriers and data cleanup ordering apply.
 
 YAASM imports remote contents into immutable snapshots in its data directory. It treats the bundle as a read-only input. After successful deployment, the caller may move or delete the bundle without breaking deployed skills. Every later `deploy --bundle` invocation still requires its bundle input. The caller owns bundle storage, transport, and removal. Forced process termination during construction can leave a `.yaasm-bundle-*` directory beside the requested output. The caller may remove this unpublished content.
 
-The manifest is trusted metadata, not a signature or proof of origin. Object hashes detect damaged payloads but do not authenticate their origin. Callers must leave published data snapshots unchanged.
+The manifest is trusted metadata, not a signature or proof of origin. Object hashes detect damaged payloads but do not authenticate their origin. For collection-selected remote skills, `bundle.toml` is the authoritative offline inventory of matched skills at the locked revision. Callers must leave published data snapshots unchanged.
 
 ### Symlinks and Windows
 

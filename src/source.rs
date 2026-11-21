@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -10,7 +10,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::config::{SourceConfig, SourceKind};
+use crate::collections::{
+    CandidateDir, discover_remote_skills, discover_remote_skills_lenient,
+    remote_collection_prefixes,
+};
+use crate::config::{CollectionConfig, SourceConfig, SourceKind};
 use crate::paths::{canonicalize_with_missing, simplified};
 
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
@@ -26,12 +30,19 @@ pub struct SourceMaterializer {
 pub struct MaterializedSource {
     pub revision: String,
     pub snapshot: Option<PathBuf>,
+    pub discovered_skills: BTreeMap<String, String>,
 }
 
 pub struct TrackedFile {
     pub path: String,
     pub mode: String,
     pub sha256: String,
+}
+
+struct RawTreeEntry {
+    mode: String,
+    object_id: String,
+    path: Vec<u8>,
 }
 
 impl SourceMaterializer {
@@ -44,23 +55,35 @@ impl SourceMaterializer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve(
         &self,
         name: &str,
         source: &SourceConfig,
         fingerprint: &str,
         requested_revision: Option<&str>,
-        paths: &[String],
+        explicit_paths: &[String],
+        collections: &[CollectionConfig],
+        explicit_folded: &BTreeMap<String, String>,
         rebuild_repository: bool,
     ) -> Result<MaterializedSource> {
         let (repository, revision) = self
             .resolve_repository(name, source, requested_revision, rebuild_repository)
             .await?;
 
-        let selected = selected_paths(paths);
-        let required: Vec<_> = paths
-            .iter()
-            .cloned()
+        let discovered_skills = if collections.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.discover_in_repository(name, &repository, &revision, collections, explicit_folded)
+                .await?
+        };
+
+        let mut all_paths = explicit_paths.to_vec();
+        all_paths.extend(discovered_skills.values().cloned());
+
+        let selected = selected_paths(&all_paths);
+        let required: Vec<_> = all_paths
+            .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -78,7 +101,164 @@ impl SourceMaterializer {
                 .await?,
             )
         };
-        Ok(MaterializedSource { revision, snapshot })
+        Ok(MaterializedSource {
+            revision,
+            snapshot,
+            discovered_skills,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_cached_source(
+        &self,
+        name: &str,
+        source: &SourceConfig,
+        fingerprint: &str,
+        revision: &str,
+        explicit_paths: &[String],
+        collections: &[CollectionConfig],
+        explicit_folded: &BTreeMap<String, String>,
+    ) -> Result<Option<MaterializedSource>> {
+        let discovered_skills = if collections.is_empty() {
+            BTreeMap::new()
+        } else {
+            let Some(repository) = self.matching_local_repository(name, source).await? else {
+                return Ok(None);
+            };
+            if !self.has_commit(&repository, revision).await {
+                return Ok(None);
+            }
+            match self
+                .discover_in_repository(name, &repository, revision, collections, explicit_folded)
+                .await
+            {
+                Ok(skills) => skills,
+                Err(_) => return Ok(None),
+            }
+        };
+
+        let mut all_paths = explicit_paths.to_vec();
+        all_paths.extend(discovered_skills.values().cloned());
+        let selected = selected_paths(&all_paths);
+        if selected.is_empty() {
+            return Ok(Some(MaterializedSource {
+                revision: revision.to_owned(),
+                snapshot: None,
+                discovered_skills,
+            }));
+        }
+        let Some(snapshot) = self.snapshot_path(fingerprint, revision, &all_paths) else {
+            return Ok(None);
+        };
+        if tokio::fs::try_exists(&snapshot).await? {
+            let required: Vec<_> = all_paths
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if self.validate_snapshot(&snapshot, &required).await.is_err() {
+                return Ok(None);
+            }
+            Ok(Some(MaterializedSource {
+                revision: revision.to_owned(),
+                snapshot: Some(snapshot),
+                discovered_skills,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn discover_skills_in_cached_repo(
+        &self,
+        name: &str,
+        revision: &str,
+        collections: &[CollectionConfig],
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        if collections.is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let repository = self.data_dir.join("repos").join(name);
+        if !tokio::fs::try_exists(repository.join(".git")).await?
+            || !self.has_commit(&repository, revision).await
+        {
+            return Ok(None);
+        }
+        let refs: Vec<_> = collections.iter().collect();
+        let prefixes = selected_paths(&remote_collection_prefixes(&refs)?);
+        let candidates = self
+            .list_candidate_dirs(&repository, revision, &prefixes)
+            .await?;
+        Ok(Some(discover_remote_skills_lenient(
+            name,
+            &refs,
+            &candidates,
+        )?))
+    }
+
+    pub async fn discover_skills_for_diff(
+        &self,
+        name: &str,
+        revision: &str,
+        collections: &[CollectionConfig],
+    ) -> Result<BTreeMap<String, String>> {
+        if collections.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let repository = self.data_dir.join("repos").join(name);
+        if !self.has_commit(&repository, revision).await {
+            self.fetch(&repository, Some(revision)).await?;
+        }
+        let refs: Vec<_> = collections.iter().collect();
+        let prefixes = selected_paths(&remote_collection_prefixes(&refs)?);
+        let candidates = self
+            .list_candidate_dirs(&repository, revision, &prefixes)
+            .await?;
+        discover_remote_skills_lenient(name, &refs, &candidates)
+    }
+
+    async fn discover_in_repository(
+        &self,
+        name: &str,
+        repository: &Path,
+        revision: &str,
+        collections: &[CollectionConfig],
+        explicit_folded: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let refs: Vec<_> = collections.iter().collect();
+        let prefixes = selected_paths(&remote_collection_prefixes(&refs)?);
+        let candidates = self
+            .list_candidate_dirs(repository, revision, &prefixes)
+            .await?;
+        discover_remote_skills(name, &refs, &candidates, explicit_folded)
+    }
+
+    async fn list_candidate_dirs(
+        &self,
+        repository: &Path,
+        revision: &str,
+        prefixes: &[String],
+    ) -> Result<Vec<CandidateDir>> {
+        let entries = self
+            .list_tree_entries(repository, revision, prefixes)
+            .await?;
+        let mut dirs = BTreeMap::<Vec<u8>, CandidateDir>::new();
+        for entry in entries {
+            if matches!(entry.mode.as_str(), "100644" | "100755")
+                && let Some(dir_bytes) = entry.path.strip_suffix(b"/SKILL.md")
+                && !dir_bytes.is_empty()
+            {
+                dirs.entry(dir_bytes.to_vec())
+                    .or_insert_with(|| CandidateDir::from_bytes(dir_bytes));
+            }
+        }
+        Ok(dirs.into_values().collect())
+    }
+
+    async fn has_commit(&self, repository: &Path, revision: &str) -> bool {
+        let mut command = self.git(repository);
+        command.args(["cat-file", "-e", &format!("{revision}^{{commit}}")]);
+        self.run(command, "git cat-file").await.is_ok()
     }
 
     async fn resolve_repository(
@@ -125,51 +305,108 @@ impl SourceMaterializer {
         })
     }
 
-    /// Export locked blobs as SHA-256 objects in an existing writable directory.
+    /// Resolve a locked source, expand any collections, and export its tracked blobs
+    /// as SHA-256 objects in an existing writable directory.
     /// Contents and recorded modes are independent of Git checkout settings.
     /// This operation may access the network.
-    pub async fn export_locked_tree(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_locked_source(
         &self,
         name: &str,
         source: &SourceConfig,
         revision: &str,
-        paths: &[String],
+        explicit_paths: &[String],
+        collections: &[CollectionConfig],
+        explicit_folded: &BTreeMap<String, String>,
         objects_dir: &Path,
-    ) -> Result<Vec<TrackedFile>> {
+    ) -> Result<(BTreeMap<String, String>, Vec<TrackedFile>)> {
+        if explicit_paths.is_empty() && collections.is_empty() {
+            return Ok((BTreeMap::new(), Vec::new()));
+        }
         let (repository, resolved) = self
             .resolve_repository(name, source, Some(revision), false)
             .await?;
         if resolved != revision {
             bail!("resolved revision does not match lockfile");
         }
-        let selected = selected_paths(paths);
+        let discovered_skills = if collections.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.discover_in_repository(name, &repository, revision, collections, explicit_folded)
+                .await?
+        };
+        let mut all_paths = explicit_paths.to_vec();
+        all_paths.extend(discovered_skills.values().cloned());
+        if all_paths.is_empty() {
+            return Ok((discovered_skills, Vec::new()));
+        }
+
+        let selected = selected_paths(&all_paths);
         self.prefetch_missing_objects(&repository, revision, &selected)
             .await?;
-        let mut command = self.git(&repository);
-        command
-            .args(["ls-tree", "-r", "-z", revision, "--"])
-            .args(&selected);
-        let tree = self
-            .output_bytes_with_input(command, "git ls-tree", None)
+        let tree_entries = self
+            .list_tree_entries(&repository, revision, &selected)
             .await?;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(tree_entries.len());
         let mut objects = String::new();
-        for entry in tree
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let entry = std::str::from_utf8(entry).context("bundle paths must be UTF-8")?;
-            let (header, path) = entry.split_once('\t').context("invalid Git tree entry")?;
-            let fields: Vec<_> = header.split_whitespace().collect();
-            if fields.len() != 3 || !matches!(fields[0], "100644" | "100755" | "120000") {
+        for entry in tree_entries {
+            let path = String::from_utf8(entry.path).context("bundle paths must be UTF-8")?;
+            if !matches!(entry.mode.as_str(), "100644" | "100755" | "120000") {
                 bail!("unsupported Git tree entry `{path}`");
             }
-            objects.push_str(fields[2]);
+            objects.push_str(&entry.object_id);
             objects.push('\n');
-            entries.push((path.to_owned(), fields[0].to_owned()));
+            entries.push((path, entry.mode));
         }
-        self.export_blobs(&repository, &objects, entries, objects_dir)
-            .await
+        let files = self
+            .export_blobs(&repository, &objects, entries, objects_dir)
+            .await?;
+        Ok((discovered_skills, files))
+    }
+
+    async fn list_tree_entries(
+        &self,
+        repository: &Path,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<Vec<RawTreeEntry>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for chunk in chunk_git_paths(paths) {
+            let mut command = self.git(repository);
+            command
+                .args(["ls-tree", "-r", "-z", revision, "--"])
+                .args(chunk);
+            let tree = self
+                .output_bytes_with_input(command, "git ls-tree", None)
+                .await?;
+            for raw in tree
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+            {
+                let tab = raw
+                    .iter()
+                    .position(|byte| *byte == b'\t')
+                    .context("invalid Git tree entry")?;
+                let header = std::str::from_utf8(&raw[..tab]).context("invalid Git tree header")?;
+                let path = raw[tab + 1..].to_vec();
+                let fields: Vec<_> = header.split_whitespace().collect();
+                if fields.len() != 3 {
+                    bail!(
+                        "invalid Git tree entry `{}`",
+                        String::from_utf8_lossy(&path)
+                    );
+                }
+                entries.push(RawTreeEntry {
+                    mode: fields[0].to_owned(),
+                    object_id: fields[2].to_owned(),
+                    path,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     async fn export_blobs(
@@ -233,6 +470,43 @@ impl SourceMaterializer {
         files
     }
 
+    async fn matching_local_repository(
+        &self,
+        name: &str,
+        source: &SourceConfig,
+    ) -> Result<Option<PathBuf>> {
+        let repository = self.data_dir.join("repos").join(name);
+        if !tokio::fs::try_exists(repository.join(".git")).await? {
+            return Ok(None);
+        }
+        let remote = remote_url(source)?;
+        let Ok(origin) = self
+            .git_output(
+                &repository,
+                ["config", "--get", "--default", "", "remote.origin.url"],
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        let local_path = remote
+            .split_once(':')
+            .is_none_or(|(prefix, _)| prefix.contains('/'))
+            || matches!(
+                Path::new(&remote).components().next(),
+                Some(Component::Prefix(_))
+            );
+        // Git records relative local clone origins against the working directory.
+        let matches = if local_path {
+            Path::new(&origin).is_absolute()
+                && canonicalize_with_missing(Path::new(&origin)).await?
+                    == canonicalize_with_missing(&std::env::current_dir()?.join(&remote)).await?
+        } else {
+            origin == remote
+        };
+        Ok(matches.then_some(repository))
+    }
+
     async fn ensure_repository(
         &self,
         name: &str,
@@ -240,39 +514,11 @@ impl SourceMaterializer {
         revision: Option<&str>,
         rebuild: bool,
     ) -> Result<(PathBuf, bool)> {
-        let repository = self.data_dir.join("repos").join(name);
-        let (kind, configured) = source.kind_and_repository()?;
-        let remote = match kind {
-            SourceKind::Git => configured.to_owned(),
-            SourceKind::Github => format!("https://github.com/{configured}.git"),
-        };
-        if !rebuild && tokio::fs::try_exists(repository.join(".git")).await? {
-            let origin = self
-                .git_output(
-                    &repository,
-                    ["config", "--get", "--default", "", "remote.origin.url"],
-                )
-                .await?;
-            let local_path = remote
-                .split_once(':')
-                .is_none_or(|(prefix, _)| prefix.contains('/'))
-                || matches!(
-                    Path::new(&remote).components().next(),
-                    Some(Component::Prefix(_))
-                );
-            // Git records relative local clone origins against the working directory.
-            let matches = if local_path {
-                Path::new(&origin).is_absolute()
-                    && canonicalize_with_missing(Path::new(&origin)).await?
-                        == canonicalize_with_missing(&std::env::current_dir()?.join(&remote))
-                            .await?
-            } else {
-                origin == remote
-            };
-            if matches {
-                return Ok((repository, false));
-            }
+        if !rebuild && let Some(repository) = self.matching_local_repository(name, source).await? {
+            return Ok((repository, false));
         }
+        let repository = self.data_dir.join("repos").join(name);
+        let remote = remote_url(source)?;
         if tokio::fs::try_exists(&repository).await? {
             let quarantine = self.staging_path(&format!("repo-{name}"));
             tokio::fs::rename(&repository, &quarantine)
@@ -332,14 +578,16 @@ impl SourceMaterializer {
         self.prefetch_missing_objects(repository, revision, selected_paths)
             .await?;
 
-        let mut command = self.git(repository);
-        command
-            .arg(format!("--work-tree={}", simplified(&staging).display()))
-            .args(["checkout", "--force", revision, "--"])
-            .args(selected_paths);
-        if let Err(error) = self.run(command, "git checkout").await {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(error);
+        for chunk in chunk_git_paths(selected_paths) {
+            let mut command = self.git(repository);
+            command
+                .arg(format!("--work-tree={}", simplified(&staging).display()))
+                .args(["checkout", "--force", revision, "--"])
+                .args(chunk);
+            if let Err(error) = self.run(command, "git checkout").await {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(error);
+            }
         }
         self.validate_snapshot(&staging, required_paths).await?;
         match tokio::fs::rename(&staging, &destination).await {
@@ -359,27 +607,34 @@ impl SourceMaterializer {
         selected_paths: &[String],
         required_paths: &[String],
     ) -> Result<()> {
-        let mut arguments = vec!["ls-tree", "-r", revision, "--"];
-        arguments.extend(selected_paths.iter().map(String::as_str));
-        let tree = self.git_output(repository, arguments).await?;
-        for line in tree.lines() {
-            if line.starts_with("160000 ") {
+        let entries = self
+            .list_tree_entries(repository, revision, selected_paths)
+            .await?;
+        for entry in &entries {
+            if entry.mode == "160000" {
                 bail!("selected skill tree contains an unsupported Git submodule");
             }
         }
+        let regular_files: BTreeSet<&[u8]> = entries
+            .iter()
+            .filter(|entry| matches!(entry.mode.as_str(), "100644" | "100755"))
+            .map(|entry| entry.path.as_slice())
+            .collect();
         for path in required_paths {
-            let manifest = Path::new(path)
+            let normalized = Path::new(path)
                 .components()
-                .filter(|component| *component != Component::CurDir)
-                .collect::<PathBuf>()
-                .join("SKILL.md");
-            let found = tree.lines().any(|line| {
-                line.starts_with("100")
-                    && line
-                        .split_once('\t')
-                        .is_some_and(|(_, item)| Path::new(item) == manifest)
-            });
-            if !found {
+                .filter_map(|component| match component {
+                    Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let manifest = if normalized.is_empty() {
+                "SKILL.md".to_owned()
+            } else {
+                format!("{normalized}/SKILL.md")
+            };
+            if !regular_files.contains(manifest.as_bytes()) {
                 bail!("`{path}` does not contain a regular tracked SKILL.md");
             }
         }
@@ -392,15 +647,20 @@ impl SourceMaterializer {
         revision: &str,
         selected_paths: &[String],
     ) -> Result<()> {
-        let mut arguments = vec!["rev-list", "--objects", "--missing=print", revision, "--"];
-        arguments.extend(selected_paths.iter().map(String::as_str));
-        let objects = self.git_output(repository, arguments).await?;
-        let missing = missing_object_ids(&objects);
+        let mut missing = BTreeSet::new();
+        for chunk in chunk_git_paths(selected_paths) {
+            let mut arguments = vec!["rev-list", "--objects", "--missing=print", revision, "--"];
+            arguments.extend(chunk.iter().map(String::as_str));
+            let objects = self.git_output(repository, arguments).await?;
+            for id in missing_object_ids(&objects) {
+                missing.insert(id.to_owned());
+            }
+        }
         if missing.is_empty() {
             return Ok(());
         }
 
-        let mut input = missing.join("\n");
+        let mut input = missing.into_iter().collect::<Vec<_>>().join("\n");
         input.push('\n');
         let mut command = self.git(repository);
         command
@@ -502,6 +762,7 @@ impl SourceMaterializer {
             .context("process limit closed")?;
         command
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .stdin(if has_input {
                 Stdio::piped()
             } else {
@@ -525,6 +786,14 @@ impl SourceMaterializer {
             .join(".staging")
             .join(format!("{prefix}-{}-{id}", std::process::id()))
     }
+}
+
+fn remote_url(source: &SourceConfig) -> Result<String> {
+    let (kind, configured) = source.kind_and_repository()?;
+    Ok(match kind {
+        SourceKind::Git => configured.to_owned(),
+        SourceKind::Github => format!("https://github.com/{configured}.git"),
+    })
 }
 
 fn checked_output(output: std::process::Output, label: &str) -> Result<Vec<u8>> {
@@ -569,6 +838,28 @@ fn missing_object_ids(output: &str) -> Vec<&str> {
         .lines()
         .filter_map(|line| line.strip_prefix('?'))
         .collect()
+}
+
+/// Split Git pathspec arguments into batches well under OS command-line limits
+/// (including Windows's 32 KiB `CreateProcess` limit).
+fn chunk_git_paths(paths: &[String]) -> Vec<&[String]> {
+    const MAX_BATCH_BYTES: usize = 16 * 1024;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes: usize = 0;
+    for (index, path) in paths.iter().enumerate() {
+        let cost = path.len().saturating_add(1);
+        if index > start && bytes.saturating_add(cost) > MAX_BATCH_BYTES {
+            chunks.push(&paths[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(cost);
+    }
+    if start < paths.len() {
+        chunks.push(&paths[start..]);
+    }
+    chunks
 }
 
 pub fn selected_paths(paths: &[String]) -> Vec<String> {
@@ -668,5 +959,21 @@ mod tests {
     #[test]
     fn quotes_ssh_control_paths_for_the_shell() {
         assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+    }
+
+    #[test]
+    fn chunk_git_paths_bounds_batch_size() {
+        let paths: Vec<String> = (0..500)
+            .map(|i| format!("skills/{:0>60}-{i}", "a"))
+            .collect();
+        let chunks = chunk_git_paths(&paths);
+        assert!(chunks.len() > 1);
+        let flattened: Vec<String> = chunks.iter().flat_map(|c| c.iter().cloned()).collect();
+        assert_eq!(flattened, paths);
+        for chunk in chunks {
+            assert!(!chunk.is_empty());
+            let total: usize = chunk.iter().map(|p| p.len() + 1).sum();
+            assert!(total <= 16 * 1024);
+        }
     }
 }

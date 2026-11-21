@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{Config, LOCAL_SOURCE};
+use crate::collections::{CandidateDir, discover_remote_skills_from_bundle, normalize_remote_rule};
+use crate::config::{CollectionConfig, Config, LOCAL_SOURCE, validate_named_collection};
 use crate::lockfile::{LockedSource, Lockfile};
 use crate::source::{MaterializedSource, SourceMaterializer};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 struct BundleStaging(std::path::PathBuf);
@@ -26,6 +27,7 @@ impl Drop for BundleStaging {
 #[serde(deny_unknown_fields)]
 pub struct Bundle {
     version: u32,
+    selection_fingerprint: String,
     sources: BTreeMap<String, BundleSource>,
     skills: BTreeMap<String, RemoteSkill>,
 }
@@ -52,14 +54,14 @@ enum FileKind {
     Symlink,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RemoteSkill {
-    source: String,
-    path: String,
+pub struct RemoteSkill {
+    pub source: String,
+    pub path: String,
 }
 
-fn remote_skills(config: &Config) -> Result<BTreeMap<String, RemoteSkill>> {
+fn explicit_remote_skills(config: &Config) -> Result<BTreeMap<String, RemoteSkill>> {
     let mut skills = BTreeMap::new();
     for (name, skill) in &config.skills {
         if skill.source == LOCAL_SOURCE {
@@ -91,6 +93,51 @@ fn remote_skills(config: &Config) -> Result<BTreeMap<String, RemoteSkill>> {
     Ok(skills)
 }
 
+fn selection_fingerprint(
+    config: &Config,
+    explicit_skills: &BTreeMap<String, RemoteSkill>,
+) -> Result<String> {
+    let mut canonical_collections = Vec::new();
+    for collection in &config.collections {
+        if collection.source == LOCAL_SOURCE {
+            continue;
+        }
+        if !config.sources.contains_key(&collection.source) {
+            bail!(
+                "collection references unknown source `{}`",
+                collection.source
+            );
+        }
+        // Rule order inside `paths` is significant because `!` negations apply in order.
+        let mut rules = Vec::with_capacity(collection.paths.len());
+        for raw in &collection.paths {
+            let rule = normalize_remote_rule(raw)?;
+            rules.push((rule.negated, rule.pattern));
+        }
+        canonical_collections.push((collection.source.clone(), rules));
+    }
+    canonical_collections.sort();
+
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"yaasm-bundle-selection-v1");
+    hash_len(&mut hasher, explicit_skills.len());
+    for (name, skill) in explicit_skills {
+        hash_field(&mut hasher, name.as_bytes());
+        hash_field(&mut hasher, skill.source.as_bytes());
+        hash_field(&mut hasher, skill.path.as_bytes());
+    }
+    hash_len(&mut hasher, canonical_collections.len());
+    for (source, rules) in &canonical_collections {
+        hash_field(&mut hasher, source.as_bytes());
+        hash_len(&mut hasher, rules.len());
+        for (negated, pattern) in rules {
+            hash_field(&mut hasher, if *negated { b"negated" } else { b"positive" });
+            hash_field(&mut hasher, pattern.as_bytes());
+        }
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
 impl Bundle {
     pub async fn build(
         output: &Path,
@@ -103,10 +150,13 @@ impl Bundle {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("failed to inspect bundle output"),
         }
+        let explicit = explicit_remote_skills(config)?;
+        let fingerprint = selection_fingerprint(config, &explicit)?;
         let mut bundle = Self {
             version: VERSION,
+            selection_fingerprint: fingerprint,
             sources: BTreeMap::new(),
-            skills: remote_skills(config)?,
+            skills: explicit,
         };
         let parent = output.parent().context("bundle output has no parent")?;
         // A sibling staging directory keeps publication on the same filesystem.
@@ -138,9 +188,16 @@ impl Bundle {
             set_mode(staging, 0o755).await?;
             set_mode(&staging.join("objects"), 0o755).await?;
         }
+        let explicit_folded: BTreeMap<String, String> = self
+            .skills
+            .keys()
+            .map(|name| (name.to_ascii_lowercase(), name.clone()))
+            .collect();
+        let mut all_folded = explicit_folded.clone();
+
         for (name, source) in &config.sources {
             let locked = lock.sources[name].clone();
-            let paths: Vec<_> = self
+            let explicit_paths: Vec<_> = self
                 .skills
                 .values()
                 .filter(|skill| &skill.source == name)
@@ -152,34 +209,59 @@ impl Bundle {
                     }
                 })
                 .collect();
-            let mut files = BTreeMap::new();
-            if !paths.is_empty() {
-                let tracked = materializer
-                    .export_locked_tree(
-                        name,
-                        source,
-                        &locked.revision,
-                        &paths,
-                        &staging.join("objects"),
-                    )
-                    .await
-                    .with_context(|| format!("source `{name}`"))?;
-                for file in tracked {
-                    validate_path(&file.path)?;
-                    let kind = match file.mode.as_str() {
-                        "100644" => FileKind::File,
-                        "100755" => FileKind::Executable,
-                        "120000" => FileKind::Symlink,
-                        _ => bail!("unsupported Git file mode {}", file.mode),
-                    };
-                    let sha256 = file.sha256;
-                    #[cfg(unix)]
-                    set_mode(&staging.join("objects").join(&sha256), 0o644).await?;
-                    files.insert(file.path, BundleFile { kind, sha256 });
+            let source_collections: Vec<CollectionConfig> = config
+                .collections
+                .iter()
+                .filter(|collection| &collection.source == name)
+                .cloned()
+                .collect();
+
+            let (discovered, tracked) = materializer
+                .export_locked_source(
+                    name,
+                    source,
+                    &locked.revision,
+                    &explicit_paths,
+                    &source_collections,
+                    &explicit_folded,
+                    &staging.join("objects"),
+                )
+                .await
+                .with_context(|| format!("source `{name}`"))?;
+
+            for (skill_name, skill_path) in discovered {
+                validate_path(&skill_path)?;
+                let lower = skill_name.to_ascii_lowercase();
+                if let Some(existing) = all_folded.insert(lower, skill_name.clone()) {
+                    bail!(
+                        "source `{name}` discovered skill `{skill_name}` which conflicts with `{existing}`"
+                    );
                 }
+                self.skills.insert(
+                    skill_name,
+                    RemoteSkill {
+                        source: name.clone(),
+                        path: skill_path,
+                    },
+                );
+            }
+
+            let mut files = BTreeMap::new();
+            for file in tracked {
+                validate_path(&file.path)?;
+                let kind = match file.mode.as_str() {
+                    "100644" => FileKind::File,
+                    "100755" => FileKind::Executable,
+                    "120000" => FileKind::Symlink,
+                    _ => bail!("unsupported Git file mode {}", file.mode),
+                };
+                let sha256 = file.sha256;
+                #[cfg(unix)]
+                set_mode(&staging.join("objects").join(&sha256), 0o644).await?;
+                files.insert(file.path, BundleFile { kind, sha256 });
             }
             let source = BundleSource { locked, files };
-            self.validate_source(name, &source)?;
+            self.validate_source(name, &source, config)?;
             self.sources.insert(name.clone(), source);
         }
         tokio::fs::write(staging.join("bundle.toml"), toml::to_string_pretty(self)?).await?;
@@ -202,13 +284,47 @@ impl Bundle {
             .map(|(name, source)| (name, &source.locked))
             .collect();
         let expected: BTreeMap<_, _> = lock.sources.iter().collect();
-        if identities != expected || bundle.skills != remote_skills(config)? {
+        let explicit = explicit_remote_skills(config)?;
+        let expected_selection = selection_fingerprint(config, &explicit)?;
+        if identities != expected || bundle.selection_fingerprint != expected_selection {
             bail!("bundle does not match remote configuration and lockfile");
+        }
+        let collection_sources: BTreeSet<&str> = config
+            .collections
+            .iter()
+            .filter(|collection| collection.source != LOCAL_SOURCE)
+            .map(|collection| collection.source.as_str())
+            .collect();
+        for (name, skill) in &bundle.skills {
+            if !bundle.sources.contains_key(&skill.source) {
+                bail!(
+                    "bundle skill `{name}` references unknown source `{}`",
+                    skill.source
+                );
+            }
+            match explicit.get(name) {
+                Some(expected_skill) if expected_skill != skill => {
+                    bail!("bundle does not match remote configuration and lockfile");
+                }
+                None if !collection_sources.contains(skill.source.as_str()) => {
+                    bail!("bundle does not match remote configuration and lockfile");
+                }
+                _ => {}
+            }
+        }
+        for (name, expected_skill) in &explicit {
+            if bundle.skills.get(name) != Some(expected_skill) {
+                bail!("bundle does not match remote configuration and lockfile");
+            }
         }
         Ok(bundle)
     }
 
-    fn validate_source(&self, name: &str, source: &BundleSource) -> Result<()> {
+    pub fn skills(&self) -> &BTreeMap<String, RemoteSkill> {
+        &self.skills
+    }
+
+    fn validate_source(&self, name: &str, source: &BundleSource, config: &Config) -> Result<()> {
         let mut folded = BTreeMap::new();
         for (path, file) in &source.files {
             validate_path(path)?;
@@ -238,7 +354,17 @@ impl Bundle {
                 }
             }
         }
+        validate_named_collection(
+            "skill",
+            self.skills
+                .iter()
+                .filter(|(_, skill)| skill.source == name)
+                .map(|(skill_name, _)| skill_name),
+        )?;
         for skill in self.skills.values().filter(|skill| skill.source == name) {
+            if !skill.path.is_empty() {
+                validate_path(&skill.path)?;
+            }
             let manifest = if skill.path.is_empty() {
                 "SKILL.md".into()
             } else {
@@ -247,6 +373,44 @@ impl Bundle {
             match source.files.get(&manifest) {
                 Some(file) if file.kind != FileKind::Symlink => {}
                 _ => bail!("bundle skill `{}` has no regular SKILL.md", skill.path),
+            }
+        }
+        let source_collections: Vec<&CollectionConfig> = config
+            .collections
+            .iter()
+            .filter(|collection| collection.source == name)
+            .collect();
+        if !source_collections.is_empty() {
+            let explicit = explicit_remote_skills(config)?;
+            let explicit_folded: BTreeMap<String, String> = explicit
+                .keys()
+                .map(|skill_name| (skill_name.to_ascii_lowercase(), skill_name.clone()))
+                .collect();
+            let candidate_dirs: Vec<CandidateDir> = source
+                .files
+                .iter()
+                .filter(|(_, file)| file.kind != FileKind::Symlink)
+                .filter_map(|(path, _)| path.strip_suffix("/SKILL.md"))
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| CandidateDir::utf8(dir.to_owned()))
+                .collect();
+            let expected_discovered = discover_remote_skills_from_bundle(
+                name,
+                &source_collections,
+                &candidate_dirs,
+                &explicit_folded,
+            )
+            .context("bundle does not match remote configuration and lockfile")?;
+            let actual_discovered: BTreeMap<String, String> = self
+                .skills
+                .iter()
+                .filter(|(skill_name, skill)| {
+                    skill.source == name && !explicit.contains_key(*skill_name)
+                })
+                .map(|(skill_name, skill)| (skill_name.clone(), skill.path.clone()))
+                .collect();
+            if actual_discovered != expected_discovered {
+                bail!("bundle does not match remote configuration and lockfile");
             }
         }
         Ok(())
@@ -261,9 +425,10 @@ impl Bundle {
         root: &Path,
         data: &Path,
         name: &str,
+        config: &Config,
     ) -> Result<MaterializedSource> {
         let source = &self.sources[name];
-        self.validate_source(name, source)?;
+        self.validate_source(name, source, config)?;
         #[cfg(windows)]
         if let Some((path, _)) = source
             .files
@@ -278,6 +443,7 @@ impl Bundle {
             return Ok(MaterializedSource {
                 revision: source.locked.revision.clone(),
                 snapshot: None,
+                discovered_skills: BTreeMap::new(),
             });
         }
         let identity = digest(toml::to_string(source)?.as_bytes());
@@ -357,12 +523,22 @@ impl Bundle {
         Ok(MaterializedSource {
             revision: source.locked.revision.clone(),
             snapshot: Some(destination),
+            discovered_skills: BTreeMap::new(),
         })
     }
 }
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hash_len(hasher, value.len());
+    hasher.update(value);
+}
+
+fn hash_len(hasher: &mut Sha256, len: usize) {
+    hasher.update((len as u64).to_be_bytes());
 }
 
 async fn prepare_file_path(root: &Path, path: &str) -> Result<PathBuf> {

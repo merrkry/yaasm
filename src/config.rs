@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::collections::normalize_remote_rule;
+
 pub const CONFIG_VERSION: u32 = 1;
 pub const LOCAL_SOURCE: &str = "local";
 
@@ -17,6 +19,8 @@ pub struct Config {
     pub sources: BTreeMap<String, SourceConfig>,
     #[serde(default)]
     pub skills: BTreeMap<String, SkillConfig>,
+    #[serde(default)]
+    pub collections: Vec<CollectionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +37,13 @@ pub struct SourceConfig {
 pub struct SkillConfig {
     pub source: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionConfig {
+    pub source: String,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +117,10 @@ impl Config {
             validate_skill_path(name, skill)?;
         }
 
+        for (index, collection) in self.collections.iter().enumerate() {
+            validate_collection(index + 1, collection)?;
+        }
+
         for target in &self.targets {
             reject_parent_components(target)
                 .with_context(|| format!("invalid target `{}`", target.display()))?;
@@ -115,23 +130,57 @@ impl Config {
     }
 }
 
-fn validate_named_collection<'a>(
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub fn validate_named_collection<'a>(
     kind: &str,
     names: impl Iterator<Item = &'a String>,
 ) -> Result<()> {
     let mut folded = BTreeSet::new();
     for name in names {
-        let valid = !name.is_empty()
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-        if !valid {
+        if !is_valid_name(name) {
             bail!("invalid {kind} name `{name}`");
         }
         if !folded.insert(name.to_ascii_lowercase()) {
             bail!("{kind} names conflict under ASCII case folding: `{name}`");
         }
+    }
+    Ok(())
+}
+
+fn validate_collection(index: usize, collection: &CollectionConfig) -> Result<()> {
+    if collection.source.is_empty() {
+        bail!("collection #{index} has an empty source");
+    }
+    if collection.paths.is_empty() {
+        bail!("collection #{index} has no paths");
+    }
+    let mut has_positive = false;
+    for raw_pattern in &collection.paths {
+        let (negated, pattern) = match raw_pattern.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, raw_pattern.as_str()),
+        };
+        if !negated {
+            has_positive = true;
+        }
+        if collection.source == LOCAL_SOURCE {
+            if pattern.is_empty() {
+                bail!("local collection #{index} has an empty path pattern");
+            }
+        } else {
+            normalize_remote_rule(raw_pattern)
+                .with_context(|| format!("invalid collection #{index}"))?;
+        }
+    }
+    if !has_positive {
+        bail!("collection #{index} must include at least one positive path pattern");
     }
     Ok(())
 }

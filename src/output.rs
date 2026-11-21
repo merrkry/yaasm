@@ -10,6 +10,17 @@ pub enum SkillChange {
     Unchanged,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUpdateReport {
+    pub name: String,
+    pub previous_revision: Option<String>,
+    pub new_revision: String,
+    pub added_skills: BTreeSet<String>,
+    pub removed_skills: BTreeSet<String>,
+    pub moved_skills: BTreeSet<String>,
+    pub diff_unavailable: Option<String>,
+}
+
 pub struct Output {
     progress: MultiProgress,
     phase: ProgressBar,
@@ -60,6 +71,46 @@ impl Output {
         print_group("Updated", updated, GroupStyle::Updated);
         print_group("Removed", removed, GroupStyle::Removed);
     }
+
+    pub fn update_summary(&self, reports: &[SourceUpdateReport]) {
+        self.finish();
+        if reports.is_empty() {
+            println!("{}", style("Already up to date").dim());
+            return;
+        }
+
+        for report in reports {
+            match &report.previous_revision {
+                Some(previous) => println!(
+                    "{} {}: {} -> {}",
+                    style("Updated").cyan().bold(),
+                    report.name,
+                    short_revision(previous),
+                    short_revision(&report.new_revision),
+                ),
+                None => println!(
+                    "{} {}: {}",
+                    style("Locked").green().bold(),
+                    report.name,
+                    short_revision(&report.new_revision),
+                ),
+            }
+            print_indented_group("Added skills", &report.added_skills, GroupStyle::Added);
+            print_indented_group("Moved skills", &report.moved_skills, GroupStyle::Updated);
+            print_indented_group(
+                "Removed skills",
+                &report.removed_skills,
+                GroupStyle::Removed,
+            );
+            if let Some(reason) = &report.diff_unavailable {
+                println!("  {}: {reason}", style("Skill diff unavailable").yellow());
+            }
+        }
+    }
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..12).unwrap_or(revision)
 }
 
 impl Default for Output {
@@ -84,13 +135,28 @@ fn print_group(label: &str, names: &BTreeSet<String>, group_style: GroupStyle) {
     if names.is_empty() {
         return;
     }
-    let label = match group_style {
-        GroupStyle::Added => style(label).green().bold(),
-        GroupStyle::Updated => style(label).cyan().bold(),
-        GroupStyle::Removed => style(label).red().bold(),
-    };
+    let label = style_label(label, group_style);
     println!(
         "{label}: {}",
         names.iter().cloned().collect::<Vec<_>>().join(", ")
     );
+}
+
+fn print_indented_group(label: &str, names: &BTreeSet<String>, group_style: GroupStyle) {
+    if names.is_empty() {
+        return;
+    }
+    let label = style_label(label, group_style);
+    println!(
+        "  {label}: {}",
+        names.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+}
+
+fn style_label(label: &str, group_style: GroupStyle) -> console::StyledObject<&str> {
+    match group_style {
+        GroupStyle::Added => style(label).green().bold(),
+        GroupStyle::Updated => style(label).cyan().bold(),
+        GroupStyle::Removed => style(label).red().bold(),
+    }
 }

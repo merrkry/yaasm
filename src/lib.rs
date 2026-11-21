@@ -1,6 +1,7 @@
 pub mod app;
 mod bundle;
 pub mod cli;
+mod collections;
 pub mod config;
 pub mod links;
 pub mod lockfile;
