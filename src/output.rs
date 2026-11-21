@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::fmt::Display;
 
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+const INDENT_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillChange {
@@ -67,9 +70,10 @@ impl Output {
             return;
         }
 
-        print_group("Added", added, GroupStyle::Added);
-        print_group("Updated", updated, GroupStyle::Updated);
-        print_group("Removed", removed, GroupStyle::Removed);
+        let out = Indented::new();
+        write_changes(&out, ChangeSymbol::Added, added);
+        write_changes(&out, ChangeSymbol::Changed, updated);
+        write_changes(&out, ChangeSymbol::Removed, removed);
     }
 
     pub fn update_summary(&self, reports: &[SourceUpdateReport]) {
@@ -79,32 +83,34 @@ impl Output {
             return;
         }
 
+        let out = Indented::new();
         for report in reports {
             match &report.previous_revision {
-                Some(previous) => println!(
+                Some(previous) => out.line(format_args!(
                     "{} {}: {} -> {}",
                     style("Updated").cyan().bold(),
                     report.name,
                     short_revision(previous),
                     short_revision(&report.new_revision),
-                ),
-                None => println!(
+                )),
+                None => out.line(format_args!(
                     "{} {}: {}",
                     style("Locked").green().bold(),
                     report.name,
                     short_revision(&report.new_revision),
-                ),
+                )),
             }
-            print_indented_group("Added skills", &report.added_skills, GroupStyle::Added);
-            print_indented_group("Moved skills", &report.moved_skills, GroupStyle::Updated);
-            print_indented_group(
-                "Removed skills",
-                &report.removed_skills,
-                GroupStyle::Removed,
-            );
-            if let Some(reason) = &report.diff_unavailable {
-                println!("  {}: {reason}", style("Skill diff unavailable").yellow());
-            }
+            out.nested(|child| {
+                write_changes(child, ChangeSymbol::Added, &report.added_skills);
+                write_changes(child, ChangeSymbol::Changed, &report.moved_skills);
+                write_changes(child, ChangeSymbol::Removed, &report.removed_skills);
+                if let Some(reason) = &report.diff_unavailable {
+                    child.line(format_args!(
+                        "{}: {reason}",
+                        style("Skill diff unavailable").yellow()
+                    ));
+                }
+            });
         }
     }
 }
@@ -125,38 +131,46 @@ fn spinner_style() -> ProgressStyle {
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
 }
 
-enum GroupStyle {
+struct Indented {
+    depth: usize,
+}
+
+impl Indented {
+    fn new() -> Self {
+        Self { depth: 0 }
+    }
+
+    fn line(&self, content: impl Display) {
+        println!("{:width$}{content}", "", width = self.depth * INDENT_WIDTH);
+    }
+
+    fn nested(&self, f: impl FnOnce(&Self)) {
+        f(&Self {
+            depth: self.depth + 1,
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChangeSymbol {
     Added,
-    Updated,
+    Changed,
     Removed,
 }
 
-fn print_group(label: &str, names: &BTreeSet<String>, group_style: GroupStyle) {
-    if names.is_empty() {
-        return;
+impl ChangeSymbol {
+    fn styled(self) -> console::StyledObject<&'static str> {
+        match self {
+            Self::Added => style("+").green().bold(),
+            Self::Changed => style("~").cyan().bold(),
+            Self::Removed => style("-").red().bold(),
+        }
     }
-    let label = style_label(label, group_style);
-    println!(
-        "{label}: {}",
-        names.iter().cloned().collect::<Vec<_>>().join(", ")
-    );
 }
 
-fn print_indented_group(label: &str, names: &BTreeSet<String>, group_style: GroupStyle) {
-    if names.is_empty() {
-        return;
-    }
-    let label = style_label(label, group_style);
-    println!(
-        "  {label}: {}",
-        names.iter().cloned().collect::<Vec<_>>().join(", ")
-    );
-}
-
-fn style_label(label: &str, group_style: GroupStyle) -> console::StyledObject<&str> {
-    match group_style {
-        GroupStyle::Added => style(label).green().bold(),
-        GroupStyle::Updated => style(label).cyan().bold(),
-        GroupStyle::Removed => style(label).red().bold(),
+fn write_changes(out: &Indented, symbol: ChangeSymbol, names: &BTreeSet<String>) {
+    let prefix = symbol.styled();
+    for name in names {
+        out.line(format_args!("{prefix} {name}"));
     }
 }

@@ -154,10 +154,10 @@ paths = {remote_paths}
     assert_success(&initial_update);
     let stdout = String::from_utf8_lossy(&initial_update.stdout);
     assert!(stdout.contains("Locked origin:"), "{stdout}");
-    assert!(stdout.contains("Added skills:"), "{stdout}");
-    assert!(stdout.contains("alpha"), "{stdout}");
-    assert!(stdout.contains("beta"), "{stdout}");
-    assert!(stdout.contains("draft-keep"), "{stdout}");
+    assert!(
+        stdout.contains("  + alpha\n  + beta\n  + draft-keep\n"),
+        "{stdout}"
+    );
 
     let noop_update = yaasm(&config, &data, &["update"]);
     assert_success(&noop_update);
@@ -201,9 +201,9 @@ paths = {remote_paths}
     assert_success(&update);
     let stdout = String::from_utf8_lossy(&update.stdout);
     assert!(stdout.contains("Updated origin:"), "{stdout}");
-    assert!(stdout.contains("Added skills: delta"), "{stdout}");
-    assert!(stdout.contains("Moved skills: alpha"), "{stdout}");
-    assert!(stdout.contains("Removed skills: beta"), "{stdout}");
+    assert!(stdout.contains("  + delta\n"), "{stdout}");
+    assert!(stdout.contains("  ~ alpha\n"), "{stdout}");
+    assert!(stdout.contains("  - beta\n"), "{stdout}");
 
     assert_success(&yaasm(&config, &data, &["deploy"]));
     assert_eq!(
@@ -226,7 +226,7 @@ paths = {remote_paths}
     assert_success(&ref_update);
     let ref_stdout = String::from_utf8_lossy(&ref_update.stdout);
     assert!(ref_stdout.contains("Updated origin:"), "{ref_stdout}");
-    assert!(ref_stdout.contains("Added skills: epsilon"), "{ref_stdout}");
+    assert!(ref_stdout.contains("  + epsilon\n"), "{ref_stdout}");
 
     // Changing source URL preserves diff baseline from the cached local repo before rebuild.
     let repo_alt = temp.path().join("repo-alt");
@@ -237,8 +237,8 @@ paths = {remote_paths}
     let url_update = yaasm(&config, &data, &["update"]);
     assert_success(&url_update);
     let url_stdout = String::from_utf8_lossy(&url_update.stdout);
-    assert!(url_stdout.contains("Added skills: omega"), "{url_stdout}");
-    assert!(url_stdout.contains("Removed skills:"), "{url_stdout}");
+    assert!(url_stdout.contains("  + omega\n"), "{url_stdout}");
+    assert!(url_stdout.contains("  - alpha\n"), "{url_stdout}");
     assert!(
         !url_stdout.contains("Skill diff unavailable"),
         "{url_stdout}"
@@ -687,7 +687,7 @@ paths = ["skills/*"]
     assert_failure(&conflict_out, "discovered skill conflict");
     let stdout = String::from_utf8_lossy(&conflict_out.stdout);
     assert!(stdout.contains("Updated c:"), "{stdout}");
-    assert!(stdout.contains("Added skills: delta"), "{stdout}");
+    assert!(stdout.contains("  + delta\n"), "{stdout}");
     let after_conflict: toml::Value =
         toml::from_str(&fs::read_to_string(config.join("lock.toml")).unwrap()).unwrap();
     assert_eq!(
